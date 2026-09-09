@@ -121,19 +121,28 @@ def query_ollama(prompt):
         return f"Erreur: {str(e)}"
 
 
+PERSONA = f"""Tu es {{name}}, un majordome anglais d'une soixantaine d'années, au service de l'utilisateur \
+depuis de nombreuses années. Tu es calme, courtois, un brin pince-sans-rire, et tu vouvoies toujours \
+l'utilisateur. Tes réponses sont brèves (une phrase, deux maximum) mais jamais froides ni robotiques : \
+elles ont la voix d'un homme posé qui a de l'expérience et un léger sens de l'humour discret. Tu ne \
+dis jamais que tu es une intelligence artificielle."""
+
+
 def interpret_command(user_text):
     """Interprète la commande avec le LLM"""
-    prompt = f"""Tu es {CONFIG['assistant_name']}, un assistant vocal pour PC. L'utilisateur dit: "{user_text}"
+    prompt = f"""{PERSONA.format(name=CONFIG['assistant_name'])}
+
+L'utilisateur dit : "{user_text}"
 
 Réponds UNIQUEMENT en JSON avec ces champs, sans texte autour ni balises markdown:
-{{"action": "type_action", "target": "cible", "response": "ta réponse vocale"}}
+{{"action": "type_action", "target": "cible", "response": "ta réponse vocale, dans ta personnalité"}}
 
 Actions possibles: play_pause, next_track, prev_track, volume_up, volume_down,
 open_app, close_app, shutdown, restart, time, help
 
 Exemple:
-- "pause la musique" → {{"action": "play_pause", "target": "", "response": "J'ai mis en pause"}}
-- "ouvre firefox" → {{"action": "open_app", "target": "firefox", "response": "Ouverture de Firefox"}}
+- "pause la musique" → {{"action": "play_pause", "target": "", "response": "Musique en pause, comme vous le souhaitiez."}}
+- "ouvre firefox" → {{"action": "open_app", "target": "firefox", "response": "Firefox arrive à l'instant, monsieur."}}
 - "quelle heure" → {{"action": "time", "target": "", "response": "Il est 14h30"}}
 
 Réponds maintenant en JSON uniquement:"""
@@ -241,7 +250,7 @@ def run(stop_event=None):
     print("=" * 50)
 
     _ensure_loaded()
-    speak(f"{CONFIG['assistant_name']} activé. Que puis-je faire pour vous ?")
+    speak(f"{CONFIG['assistant_name']}, à votre service. Que puis-je faire pour vous ?")
 
     while not stop_event.is_set():
         try:
@@ -255,7 +264,7 @@ def run(stop_event=None):
 
             texte_min = user_input.lower()
             if any(mot in texte_min for mot in ["arrête", "arrete", "stop", "quitte"]):
-                speak("Au revoir!")
+                speak("Très bien. Je reste à votre disposition.")
                 break
 
             command = interpret_command(user_input)
@@ -265,15 +274,15 @@ def run(stop_event=None):
 
             resultat = execute_action(action, target)
             if action == "time" and resultat:
-                response = f"Il est {resultat}"
+                response = f"Il est {resultat}, monsieur."
             speak(response)
 
         except KeyboardInterrupt:
-            speak("Assistant arrêté")
+            speak("Bien. Je me retire.")
             break
         except Exception as e:
             print(f"Erreur: {e}")
-            speak("Désolé, une erreur s'est produite")
+            speak("Toutes mes excuses, un contretemps est survenu.")
 
 
 if __name__ == "__main__":
