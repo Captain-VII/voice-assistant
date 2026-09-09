@@ -1,9 +1,18 @@
-"""Met à jour assistant_core.py depuis un manifeste distant (JSON), si configuré."""
+"""Met à jour assistant_core.py depuis un manifeste distant (JSON), si configuré.
+
+En build "source" (python tray_app.py), une mise à jour réécrit directement
+assistant_core.py sur disque. En build compilé (.exe PyInstaller), ce fichier
+n'existe plus séparément — il est intégré dans l'exécutable — donc on se
+contente de signaler qu'une nouvelle version existe, sans tenter de patcher
+le binaire en place."""
 
 import json
 import os
+import sys
 
 import requests
+
+IS_FROZEN = getattr(sys, "frozen", False)
 
 CONFIG_FILE = "update_config.json"
 VERSION_FILE = "version.txt"
@@ -28,14 +37,16 @@ def _read_manifest_url(base_dir):
 
 
 def check_and_update(base_dir):
-    """Vérifie le manifeste distant (voir update_config.json) et remplace
-    assistant_core.py si une version plus récente est disponible.
+    """Vérifie le manifeste distant (voir update_config.json).
 
     Le manifeste attendu est un JSON de la forme :
     {"version": "1.1.0", "script_url": "https://.../assistant_core.py"}
 
-    Retourne True si une mise à jour a été appliquée, False sinon (pas
-    d'URL configurée, déjà à jour, ou erreur réseau).
+    Retourne :
+    - False : rien à faire (pas d'URL configurée, déjà à jour, ou erreur réseau)
+    - True : mise à jour appliquée en place (build source uniquement)
+    - remote_version (str) : nouvelle version détectée mais non appliquée
+      automatiquement (build .exe compilé — l'utilisateur doit réinstaller)
     """
     manifest_url = _read_manifest_url(base_dir)
     if not manifest_url:
@@ -54,6 +65,9 @@ def check_and_update(base_dir):
 
     if not script_url or remote_version == local_version:
         return False
+
+    if IS_FROZEN:
+        return remote_version
 
     try:
         script_resp = requests.get(script_url, timeout=15)

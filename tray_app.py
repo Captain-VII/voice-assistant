@@ -10,7 +10,10 @@ import threading
 import pystray
 from PIL import Image, ImageDraw
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, "frozen", False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
 import updater  # noqa: E402
@@ -61,13 +64,18 @@ def is_active(item):
 
 
 def check_updates(icon, item=None):
-    updated = updater.check_and_update(BASE_DIR)
-    if updated:
+    result = updater.check_and_update(BASE_DIR)
+    if result is True:
         icon.notify("Mise à jour installée, redémarrage de l'assistant...", "Alfred")
         was_active = bool(assistant_thread and assistant_thread.is_alive())
         stop_assistant(icon)
         if was_active:
             start_assistant(icon)
+    elif isinstance(result, str):
+        icon.notify(
+            f"Version {result} disponible. Téléchargez le nouvel installeur sur GitHub pour mettre à jour.",
+            "Alfred",
+        )
     else:
         icon.notify("Déjà à jour.", "Alfred")
 
