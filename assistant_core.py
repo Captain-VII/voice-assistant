@@ -20,7 +20,7 @@ import requests
 # ============ CONFIG ============
 CONFIG = {
     "ollama_host": "http://localhost:11434",
-    "ollama_model": "llama2",
+    "ollama_model": "llama3.1",
     "whisper_model": "base",
     "language": "fr"
 }
@@ -217,7 +217,9 @@ def run(stop_event=None):
             target = command.get("target", "")
             response = command.get("response", "Commande non reconnue")
 
-            execute_action(action, target)
+            resultat = execute_action(action, target)
+            if action == "time" and resultat:
+                response = f"Il est {resultat}"
             speak(response)
 
         except KeyboardInterrupt:
