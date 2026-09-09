@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""
+Assistant Vocal Local - moteur (utilisable en standalone ou depuis tray_app.py)
+Whisper (STT) + Ollama/Llama2 (LLM) + pyttsx3 (TTS) + PyAutoGUI (Actions)
+"""
+
+import whisper
+import pyttsx3
+import pyautogui
+import subprocess
+import json
+import os
+import re
+import tempfile
+import threading
+from datetime import datetime
+
+import requests
+
+# ============ CONFIG ============
+CONFIG = {
+    "ollama_host": "http://localhost:11434",
+    "ollama_model": "llama2",
+    "whisper_model": "base",
+    "language": "fr"
+}
+
+# Applications connues (nom prononcé -> commande réelle)
+APPS = {
+    "bloc-notes": "notepad.exe",
+    "notepad": "notepad.exe",
+    "calculatrice": "calc.exe",
+    "calculette": "calc.exe",
+    "explorateur": "explorer.exe",
+    "paint": "mspaint.exe",
+    "chrome": "start chrome",
+    "navigateur": "start chrome",
+    "firefox": "start firefox",
+    "edge": "start msedge",
+}
+
+# ============ INIT (paresseux : chargé au premier appel) ============
+_whisper_model = None
+_tts_engine = None
+_init_lock = threading.Lock()
+
+
+def _ensure_loaded():
+    global _whisper_model, _tts_engine
+    with _init_lock:
+        if _whisper_model is None:
+            _whisper_model = whisper.load_model(CONFIG["whisper_model"])
+        if _tts_engine is None:
+            _tts_engine = pyttsx3.init()
+            _tts_engine.setProperty('rate', 150)
+            _tts_engine.setProperty('volume', 0.9)
+
+
+# ============ SPEECH TO TEXT ============
+def listen():
+    """Écoute le microphone et retourne le texte"""
+    import sounddevice as sd
+    import soundfile as sf
+
+    print("🎤 Écoute...")
+    duration = 5
+    sample_rate = 16000
+    audio = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1, dtype='float32')
+    sd.wait()
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        audio_path = tmp.name
+    try:
+        sf.write(audio_path, audio, sample_rate)
+        print("🔄 Transcription...")
+        result = _whisper_model.transcribe(audio_path, language=CONFIG["language"], fp16=False)
+    finally:
+        os.remove(audio_path)
+
+    text = result["text"].strip()
+    print(f"📝 Vous: {text}")
+    return text
+
+
+# ============ LLM ENGINE ============
+def query_ollama(prompt):
+    """Appelle Ollama pour traiter la commande"""
+    try:
+        response = requests.post(
+            f"{CONFIG['ollama_host']}/api/generate",
+            json={"model": CONFIG["ollama_model"], "prompt": prompt, "stream": False},
+            timeout=30
+        )
+        if response.status_code == 200:
+            return response.json()["response"]
+        return "Erreur de connexion Ollama"
+    except requests.exceptions.RequestException as e:
+        return f"Erreur: {str(e)}"
+
+
+def interpret_command(user_text):
+    """Interprète la commande avec le LLM"""
+    prompt = f"""Tu es un assistant vocal pour PC. L'utilisateur dit: "{user_text}"
+
+Réponds UNIQUEMENT en JSON avec ces champs, sans texte autour ni balises markdown:
+{{"action": "type_action", "target": "cible", "response": "ta réponse vocale"}}
+
+Actions possibles: play_pause, next_track, prev_track, volume_up, volume_down,
+open_app, close_app, shutdown, restart, time, help
+
+Exemple:
+- "pause la musique" → {{"action": "play_pause", "target": "", "response": "J'ai mis en pause"}}
+- "ouvre firefox" → {{"action": "open_app", "target": "firefox", "response": "Ouverture de Firefox"}}
+- "quelle heure" → {{"action": "time", "target": "", "response": "Il est 14h30"}}
+
+Réponds maintenant en JSON uniquement:"""
+
+    response = query_ollama(prompt)
+    # Le LLM entoure parfois le JSON de texte explicatif ou de balises ```json ... ```
+    match = re.search(r"\{.*\}", response, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+    return {"action": "help", "target": "", "response": "Je n'ai pas compris"}
+
+
+# ============ TEXT TO SPEECH ============
+def speak(text):
+    """Parle le texte"""
+    print(f"🔊 Assistant: {text}")
+    _tts_engine.say(text)
+    _tts_engine.runAndWait()
+
+
+# ============ ACTIONS SYSTEM ============
+def execute_action(action, target):
+    """Exécute une action sur le PC. Retourne True si l'action a réussi."""
+    try:
+        if action == "play_pause":
+            pyautogui.press('playpause')
+
+        elif action == "next_track":
+            pyautogui.press('nexttrack')
+
+        elif action == "prev_track":
+            pyautogui.press('prevtrack')
+
+        elif action == "volume_up":
+            for _ in range(3):
+                pyautogui.press('volumeup')
+
+        elif action == "volume_down":
+            for _ in range(3):
+                pyautogui.press('volumedown')
+
+        elif action == "open_app":
+            commande = APPS.get(target.lower().strip(), target)
+            if commande.startswith("start "):
+                os.system(commande)
+            else:
+                subprocess.Popen(commande)
+
+        elif action == "close_app":
+            nom = target.strip()
+            if nom.lower().endswith(".exe"):
+                nom = nom[:-4]
+            subprocess.run(f"taskkill /IM {nom}.exe /F", shell=True, capture_output=True)
+
+        elif action == "shutdown":
+            subprocess.run("shutdown /s /t 30", shell=True)
+
+        elif action == "restart":
+            subprocess.run("shutdown /r /t 30", shell=True)
+
+        elif action == "time":
+            return datetime.now().strftime("%H:%M")
+
+        return True
+    except Exception as e:
+        print(f"❌ Erreur exécution: {e}")
+        return False
+
+
+# ============ MAIN LOOP ============
+def run(stop_event=None):
+    """Boucle principale de l'assistant. S'arrête dès que stop_event est levé
+    (si fourni), sinon tourne jusqu'à un mot d'arrêt vocal ou Ctrl+C."""
+    if stop_event is None:
+        stop_event = threading.Event()
+
+    print("=" * 50)
+    print("🎙️  ASSISTANT VOCAL LOCAL")
+    print("=" * 50)
+
+    _ensure_loaded()
+    speak("Assistant vocal activé. Que puis-je faire pour vous?")
+
+    while not stop_event.is_set():
+        try:
+            user_input = listen()
+
+            if stop_event.is_set():
+                break
+
+            if not user_input:
+                continue
+
+            texte_min = user_input.lower()
+            if any(mot in texte_min for mot in ["arrête", "arrete", "stop", "quitte"]):
+                speak("Au revoir!")
+                break
+
+            command = interpret_command(user_input)
+            action = command.get("action", "help")
+            target = command.get("target", "")
+            response = command.get("response", "Commande non reconnue")
+
+            execute_action(action, target)
+            speak(response)
+
+        except KeyboardInterrupt:
+            speak("Assistant arrêté")
+            break
+        except Exception as e:
+            print(f"Erreur: {e}")
+            speak("Désolé, une erreur s'est produite")
+
+
+if __name__ == "__main__":
+    print("\n⚙️  Prérequis:")
+    print("1. Installer Ollama: https://ollama.ai")
+    print("2. Télécharger Llama2: ollama pull llama2")
+    print("3. Lancer Ollama: ollama serve\n")
+
+    input("Appuyez sur Entrée quand Ollama est lancé...")
+
+    run()
