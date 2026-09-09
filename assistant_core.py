@@ -27,7 +27,9 @@ CONFIG = {
     "ollama_model": "llama3.1",
     "whisper_model": "base",
     "language": "fr",
-    "edge_voice": "fr-FR-HenriNeural",  # voix masculine française (nécessite internet)
+    "edge_voice": "fr-FR-RemyMultilingualNeural",  # voix masculine française (nécessite internet)
+    "edge_rate": "-8%",
+    "edge_pitch": "-3Hz",
 }
 
 # Applications connues (nom prononcé -> commande réelle)
@@ -125,7 +127,10 @@ PERSONA = f"""Tu es {{name}}, un majordome anglais d'une soixantaine d'années, 
 depuis de nombreuses années. Tu es calme, courtois, un brin pince-sans-rire, et tu vouvoies toujours \
 l'utilisateur. Tes réponses sont brèves (une phrase, deux maximum) mais jamais froides ni robotiques : \
 elles ont la voix d'un homme posé qui a de l'expérience et un léger sens de l'humour discret. Tu ne \
-dis jamais que tu es une intelligence artificielle."""
+dis jamais que tu es une intelligence artificielle. Écris toujours des phrases fluides et complètes : \
+ne commence jamais par un mot isolé (comme "Bonsoir." seul) et ne termine jamais sur un simple point \
+d'interrogation sec — préfère une formule qui s'étoffe, par exemple "Dites-moi ce qu'il vous faut" \
+plutôt qu'un "?" abrupt."""
 
 
 def interpret_command(user_text):
@@ -160,11 +165,17 @@ Réponds maintenant en JSON uniquement:"""
 
 # ============ TEXT TO SPEECH ============
 def _speak_edge(text):
-    """Synthétise avec la voix Edge (fr-FR-HenriNeural, nécessite internet) et la joue."""
+    """Synthétise avec la voix Edge (Remy, masculine, française, nécessite internet) et la joue."""
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
         audio_path = tmp.name
     try:
-        asyncio.run(edge_tts.Communicate(text, CONFIG["edge_voice"]).save(audio_path))
+        comm = edge_tts.Communicate(
+            text,
+            CONFIG["edge_voice"],
+            rate=CONFIG["edge_rate"],
+            pitch=CONFIG["edge_pitch"],
+        )
+        asyncio.run(comm.save(audio_path))
 
         if not pygame.mixer.get_init():
             pygame.mixer.init()
@@ -178,7 +189,7 @@ def _speak_edge(text):
 
 
 def speak(text):
-    """Parle le texte. Utilise la voix Henri (Edge, masculine, française) si
+    """Parle le texte. Utilise la voix Remy (Edge, masculine, française) si
     internet est disponible, sinon retombe sur la voix locale (Hortense)."""
     print(f"🔊 {CONFIG['assistant_name']}: {text}")
     try:
@@ -250,7 +261,7 @@ def run(stop_event=None):
     print("=" * 50)
 
     _ensure_loaded()
-    speak(f"{CONFIG['assistant_name']}, à votre service. Que puis-je faire pour vous ?")
+    speak(f"Eh bien, {CONFIG['assistant_name']} à votre service. Dites-moi ce dont vous avez besoin.")
 
     while not stop_event.is_set():
         try:
@@ -264,7 +275,7 @@ def run(stop_event=None):
 
             texte_min = user_input.lower()
             if any(mot in texte_min for mot in ["arrête", "arrete", "stop", "quitte"]):
-                speak("Très bien. Je reste à votre disposition.")
+                speak("Très bien, je reste à votre entière disposition.")
                 break
 
             command = interpret_command(user_input)
@@ -278,7 +289,7 @@ def run(stop_event=None):
             speak(response)
 
         except KeyboardInterrupt:
-            speak("Bien. Je me retire.")
+            speak("Fort bien, je me retire pour cette fois.")
             break
         except Exception as e:
             print(f"Erreur: {e}")
