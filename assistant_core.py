@@ -4,6 +4,7 @@ Assistant Vocal Local - moteur (utilisable en standalone ou depuis tray_app.py)
 Whisper (STT) + Ollama/Llama2 (LLM) + pyttsx3 (TTS) + PyAutoGUI (Actions)
 """
 
+import asyncio
 import whisper
 import pyttsx3
 import pyautogui
@@ -15,6 +16,8 @@ import tempfile
 import threading
 from datetime import datetime
 
+import edge_tts
+import pygame
 import requests
 
 # ============ CONFIG ============
@@ -23,7 +26,8 @@ CONFIG = {
     "ollama_host": "http://localhost:11434",
     "ollama_model": "llama3.1",
     "whisper_model": "base",
-    "language": "fr"
+    "language": "fr",
+    "edge_voice": "fr-FR-HenriNeural",  # voix masculine française (nécessite internet)
 }
 
 # Applications connues (nom prononcé -> commande réelle)
@@ -146,11 +150,34 @@ Réponds maintenant en JSON uniquement:"""
 
 
 # ============ TEXT TO SPEECH ============
+def _speak_edge(text):
+    """Synthétise avec la voix Edge (fr-FR-HenriNeural, nécessite internet) et la joue."""
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+        audio_path = tmp.name
+    try:
+        asyncio.run(edge_tts.Communicate(text, CONFIG["edge_voice"]).save(audio_path))
+
+        if not pygame.mixer.get_init():
+            pygame.mixer.init()
+        pygame.mixer.music.load(audio_path)
+        pygame.mixer.music.play()
+        while pygame.mixer.music.get_busy():
+            pygame.time.wait(100)
+        pygame.mixer.music.unload()
+    finally:
+        os.remove(audio_path)
+
+
 def speak(text):
-    """Parle le texte"""
-    print(f"🔊 Assistant: {text}")
-    _tts_engine.say(text)
-    _tts_engine.runAndWait()
+    """Parle le texte. Utilise la voix Henri (Edge, masculine, française) si
+    internet est disponible, sinon retombe sur la voix locale (Hortense)."""
+    print(f"🔊 {CONFIG['assistant_name']}: {text}")
+    try:
+        _speak_edge(text)
+    except Exception as e:
+        print(f"⚠️  Voix Edge indisponible ({e}), repli sur la voix locale")
+        _tts_engine.say(text)
+        _tts_engine.runAndWait()
 
 
 # ============ ACTIONS SYSTEM ============
