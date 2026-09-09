@@ -19,6 +19,7 @@ import requests
 
 # ============ CONFIG ============
 CONFIG = {
+    "assistant_name": "Alfred",
     "ollama_host": "http://localhost:11434",
     "ollama_model": "llama3.1",
     "whisper_model": "base",
@@ -45,6 +46,21 @@ _tts_engine = None
 _init_lock = threading.Lock()
 
 
+def _select_voice(engine):
+    """Choisit une voix française, en préférant une voix masculine si
+    disponible. Retourne l'id de la voix choisie, ou None si aucune voix
+    française n'est installée (garde la voix par défaut du système)."""
+    voix_francaises = [v for v in engine.getProperty('voices') if 'fr' in (v.id + v.name).lower()]
+    if not voix_francaises:
+        return None
+
+    for v in voix_francaises:
+        if str(getattr(v, 'gender', '')).lower() == 'male':
+            return v.id
+
+    return voix_francaises[0].id
+
+
 def _ensure_loaded():
     global _whisper_model, _tts_engine
     with _init_lock:
@@ -54,6 +70,9 @@ def _ensure_loaded():
             _tts_engine = pyttsx3.init()
             _tts_engine.setProperty('rate', 150)
             _tts_engine.setProperty('volume', 0.9)
+            voice_id = _select_voice(_tts_engine)
+            if voice_id:
+                _tts_engine.setProperty('voice', voice_id)
 
 
 # ============ SPEECH TO TEXT ============
@@ -100,7 +119,7 @@ def query_ollama(prompt):
 
 def interpret_command(user_text):
     """Interprète la commande avec le LLM"""
-    prompt = f"""Tu es un assistant vocal pour PC. L'utilisateur dit: "{user_text}"
+    prompt = f"""Tu es {CONFIG['assistant_name']}, un assistant vocal pour PC. L'utilisateur dit: "{user_text}"
 
 Réponds UNIQUEMENT en JSON avec ces champs, sans texte autour ni balises markdown:
 {{"action": "type_action", "target": "cible", "response": "ta réponse vocale"}}
@@ -191,11 +210,11 @@ def run(stop_event=None):
         stop_event = threading.Event()
 
     print("=" * 50)
-    print("🎙️  ASSISTANT VOCAL LOCAL")
+    print(f"🎙️  {CONFIG['assistant_name'].upper()} - ASSISTANT VOCAL LOCAL")
     print("=" * 50)
 
     _ensure_loaded()
-    speak("Assistant vocal activé. Que puis-je faire pour vous?")
+    speak(f"{CONFIG['assistant_name']} activé. Que puis-je faire pour vous ?")
 
     while not stop_event.is_set():
         try:

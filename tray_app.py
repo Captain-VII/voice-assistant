@@ -40,13 +40,13 @@ def start_assistant(icon, item=None):
     assistant_thread = threading.Thread(target=assistant_core.run, args=(stop_event,), daemon=True)
     assistant_thread.start()
     icon.icon = ICON_ON
-    icon.title = "Assistant Vocal - Actif"
+    icon.title = "Alfred - Actif"
 
 
 def stop_assistant(icon, item=None):
     stop_event.set()
     icon.icon = ICON_OFF
-    icon.title = "Assistant Vocal - Arrêté"
+    icon.title = "Alfred - Arrêté"
 
 
 def toggle_assistant(icon, item):
@@ -63,13 +63,13 @@ def is_active(item):
 def check_updates(icon, item=None):
     updated = updater.check_and_update(BASE_DIR)
     if updated:
-        icon.notify("Mise à jour installée, redémarrage de l'assistant...", "Assistant Vocal")
+        icon.notify("Mise à jour installée, redémarrage de l'assistant...", "Alfred")
         was_active = bool(assistant_thread and assistant_thread.is_alive())
         stop_assistant(icon)
         if was_active:
             start_assistant(icon)
     else:
-        icon.notify("Déjà à jour.", "Assistant Vocal")
+        icon.notify("Déjà à jour.", "Alfred")
 
 
 def quit_app(icon, item=None):
@@ -83,7 +83,7 @@ def main():
         pystray.MenuItem("Vérifier les mises à jour", check_updates),
         pystray.MenuItem("Quitter", quit_app),
     )
-    icon = pystray.Icon("assistant_vocal", ICON_OFF, "Assistant Vocal", menu)
+    icon = pystray.Icon("assistant_vocal", ICON_OFF, "Alfred", menu)
 
     def setup(icon):
         icon.visible = True
