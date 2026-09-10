@@ -34,9 +34,61 @@ CONFIG = {
     # Volontairement neutre : tout décalage de ton par edge-tts s'entend comme
     # un traitement artificiel. Pour une voix plus posée, ralentir edge_rate.
     "edge_pitch": "+0Hz",
+    # Mot de réveil : Alfred n'interprète que les phrases qui le contiennent.
+    # Chaîne vide = désactivé (il réagit alors à tout ce qu'il entend).
+    "wake_word": "alfred",
+    # Orthographes que Whisper produit parfois pour ce prénom : à compléter
+    # depuis le journal si une prononciation revient sans être reconnue.
+    "wake_word_variants": [
+        "alfrède", "alfrèd", "alfrede", "alfredo", "alfret", "alfredd",
+        "alfreed", "halfred", "alfrid", "alfride", "l'fride", "alfredo",
+    ],
+    # Niveau crête en dessous duquel on ne transcrit pas. À augmenter si une
+    # télévision ou des conversations à portée de micro déclenchent Alfred,
+    # à diminuer s'il n'entend pas une voix douce ou éloignée.
+    "silence_threshold": 0.01,
 }
 
 SETTINGS_FILE = "alfred_settings.json"
+
+# Réglages exposés à l'utilisateur dans alfred_settings.json, et textes d'aide
+# associés. Source de vérité du modèle de fichier : l'installeur conserve le
+# fichier existant pour ne pas écraser les choix de l'utilisateur, si bien
+# qu'une option ajoutée dans une nouvelle version n'y apparaîtrait jamais.
+SETTINGS_EXPOSED = (
+    "edge_voice", "edge_rate", "edge_pitch",
+    "wake_word", "wake_word_variants", "silence_threshold",
+    "ollama_model", "whisper_model",
+)
+
+SETTINGS_HELP = {
+    "_aide": "Modifiez ces valeurs puis relancez Alfred. Aucune reconstruction nécessaire.",
+    "_voix_masculines": (
+        "fr-FR-RemyMultilingualNeural, fr-FR-HenriNeural, fr-BE-GerardNeural, "
+        "fr-CH-FabriceNeural, fr-CA-ThierryNeural, fr-CA-JeanNeural, "
+        "fr-CA-AntoineNeural, en-US-AndrewMultilingualNeural, "
+        "en-AU-WilliamMultilingualNeural"
+    ),
+    "_ton": (
+        "Laisser edge_pitch à +0Hz : tout décalage de ton par edge-tts s'entend "
+        "comme un traitement artificiel. Pour une voix plus posée, ralentir "
+        "edge_rate (par exemple -8%)."
+    ),
+    "_mot_de_reveil": (
+        "Alfred n'interprète que les phrases contenant wake_word. Mettre une "
+        "chaîne vide pour qu'il réagisse à tout ce qu'il entend. Si une de vos "
+        "prononciations n'est pas reconnue, regardez la ligne « ignoré, mot de "
+        "réveil absent » du journal et ajoutez l'orthographe entendue dans "
+        "wake_word_variants."
+    ),
+    "_sensibilite": (
+        "silence_threshold est le niveau sonore minimum pour qu'Alfred "
+        "transcrive. Si une télévision ou des conversations le déclenchent, "
+        "montez-le (0.02, 0.03...) ; s'il n'entend pas une voix douce ou "
+        "éloignée, baissez-le (0.005). Le journal indique la crête mesurée à "
+        "chaque écoute ignorée."
+    ),
+}
 
 if getattr(sys, "frozen", False):
     BASE_DIR = os.path.dirname(sys.executable)
@@ -75,7 +127,41 @@ def _load_settings():
             print(f"⚠️  Réglage inconnu ignoré : {cle}")
 
 
+def _sync_settings_file():
+    """Complète alfred_settings.json avec les options et aides absentes, sans
+    toucher aux valeurs déjà choisies par l'utilisateur. Sans cela, une option
+    ajoutée dans une nouvelle version resterait invisible et donc inutilisable
+    pour qui met à jour une installation existante."""
+    chemin = os.path.join(BASE_DIR, SETTINGS_FILE)
+
+    contenu = {}
+    if os.path.exists(chemin):
+        try:
+            with open(chemin, encoding="utf-8-sig") as f:
+                charge = json.load(f)
+            if isinstance(charge, dict):
+                contenu = charge
+        except (OSError, ValueError):
+            return  # fichier illisible : _load_settings l'a déjà signalé
+
+    attendu = {**SETTINGS_HELP, **{cle: CONFIG[cle] for cle in SETTINGS_EXPOSED}}
+    manquants = {cle: val for cle, val in attendu.items() if cle not in contenu}
+    if not manquants:
+        return
+
+    contenu.update(manquants)
+    try:
+        tmp = f"{chemin}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(contenu, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, chemin)
+        print(f"Réglages complétés avec les nouvelles options : {sorted(manquants)}")
+    except OSError as e:
+        print(f"⚠️  Impossible de compléter {SETTINGS_FILE} : {e}")
+
+
 _load_settings()
+_sync_settings_file()
 
 
 def save_settings(modifications):
@@ -148,12 +234,6 @@ MAX_ECHECS = 5
 SAMPLE_RATE = 16000
 LISTEN_SECONDS = 5
 
-# En dessous de ce niveau crête, on considère qu'il n'y a pas de parole et on
-# ne transcrit pas : sur du silence ou du bruit de fond, Whisper hallucine des
-# phrases entières, que le LLM traduit ensuite en commandes exécutées pour de
-# bon. Alfred tournant en permanence, ce garde-fou est indispensable.
-SILENCE_THRESHOLD = 0.01
-
 # ============ INIT (paresseux : chargé au premier appel) ============
 _whisper_model = None
 _tts_engine = None
@@ -211,6 +291,49 @@ def _normalize(texte):
     return re.sub(r"\s+", " ", t).strip()
 
 
+def _wake_regex():
+    """Motif du mot de réveil et de ses variantes. Reconstruit à chaque appel
+    pour tenir compte d'un réglage modifié à chaud. None si désactivé."""
+    mot = str(CONFIG.get("wake_word") or "").strip()
+    if not mot:
+        return None
+
+    variantes = [mot] + [str(v) for v in (CONFIG.get("wake_word_variants") or [])]
+    # Les plus longues d'abord : dans une alternance, « alfred » masquerait
+    # « alfredo » et laisserait un « o » orphelin dans la commande.
+    motifs = sorted(
+        {re.escape(v.strip()) for v in variantes if v.strip()},
+        key=len,
+        reverse=True,
+    )
+    return re.compile(r"\b(?:" + "|".join(motifs) + r")\b", re.IGNORECASE)
+
+
+def _wake_and_command(texte):
+    """Sépare le mot de réveil du reste de la phrase.
+
+    Retourne (réveillé, commande). Alfred écoutant en continu, sans ce filtre
+    il interprète et exécute pour de bon les conversations et la télévision
+    qui passent à portée de micro.
+
+    Le mot de réveil est retiré où qu'il soit, de sorte que « Alfred, quelle
+    heure est-il » comme « arrête, Alfred » fonctionnent. Une commande vide
+    signifie que seul le prénom a été prononcé : l'appelant enchaîne alors
+    sur une seconde écoute."""
+    motif = _wake_regex()
+    if motif is None:
+        return True, texte
+
+    if not motif.search(texte):
+        return False, ""
+
+    reste = re.sub(r"\s+", " ", motif.sub(" ", texte))
+    # Retiré au milieu d'une phrase, le prénom laisse une ponctuation
+    # orpheline : « Dis-moi Alfred, quelle heure » -> « Dis-moi , quelle heure ».
+    reste = re.sub(r"\s+([,.;:!?])", r"\1", reste)
+    return True, reste.strip(" ,.;:!?-—…'\"")
+
+
 # ============ SPEECH TO TEXT ============
 def listen():
     """Écoute le microphone et retourne le texte.
@@ -234,9 +357,13 @@ def listen():
     sd.wait()
     audio = audio.reshape(-1)
 
+    # Sur du silence ou du bruit de fond, Whisper hallucine des phrases
+    # entières que le LLM traduit ensuite en commandes exécutées pour de bon.
+    # Alfred tournant en permanence, ce garde-fou est indispensable.
     crete = float(abs(audio).max()) if audio.size else 0.0
-    if crete < SILENCE_THRESHOLD:
-        print(f"… silence (crête {crete:.4f}), rien à transcrire")
+    seuil = float(CONFIG.get("silence_threshold") or 0.01)
+    if crete < seuil:
+        print(f"… silence (crête {crete:.4f} < seuil {seuil}), rien à transcrire")
         return ""
 
     print("🔄 Transcription...")
@@ -533,7 +660,12 @@ def run(stop_event=None):
     print("=" * 50)
 
     _ensure_loaded()
-    speak(f"Eh bien, {CONFIG['assistant_name']} à votre service. Dites-moi ce dont vous avez besoin.")
+    if str(CONFIG.get("wake_word") or "").strip():
+        speak(f"Eh bien, {CONFIG['assistant_name']} à votre service. "
+              f"Appelez-moi par mon nom quand vous aurez besoin de moi.")
+    else:
+        speak(f"Eh bien, {CONFIG['assistant_name']} à votre service. "
+              f"Dites-moi ce dont vous avez besoin.")
 
     echecs = 0
     while not stop_event.is_set():
@@ -546,11 +678,26 @@ def run(stop_event=None):
             if not user_input:
                 continue
 
-            if _normalize(user_input) in STOP_PHRASES:
+            reveille, commande_texte = _wake_and_command(user_input)
+            if not reveille:
+                print(f"… ignoré, mot de réveil absent : {user_input!r}")
+                continue
+
+            if not commande_texte:
+                # Seul le prénom a été prononcé : on acquitte et on écoute la
+                # commande, qui dispose ainsi d'une fenêtre complète.
+                speak("Oui monsieur, je vous écoute.")
+                commande_texte = listen()
+                if stop_event.is_set():
+                    break
+                if not commande_texte:
+                    continue
+
+            if _normalize(commande_texte) in STOP_PHRASES:
                 speak("Très bien, je reste à votre entière disposition.")
                 break
 
-            command = interpret_command(user_input)
+            command = interpret_command(commande_texte)
             action = str(command.get("action") or "help")
             target = str(command.get("target") or "")
             response = str(command.get("response") or "Commande non reconnue")

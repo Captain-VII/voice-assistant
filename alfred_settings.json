@@ -2,9 +2,26 @@
   "_aide": "Modifiez ces valeurs puis relancez Alfred. Aucune reconstruction nécessaire.",
   "_voix_masculines": "fr-FR-RemyMultilingualNeural, fr-FR-HenriNeural, fr-BE-GerardNeural, fr-CH-FabriceNeural, fr-CA-ThierryNeural, fr-CA-JeanNeural, fr-CA-AntoineNeural, en-US-AndrewMultilingualNeural, en-AU-WilliamMultilingualNeural",
   "_ton": "Laisser edge_pitch à +0Hz : tout décalage de ton par edge-tts s'entend comme un traitement artificiel. Pour une voix plus posée, ralentir edge_rate (par exemple -8%).",
+  "_mot_de_reveil": "Alfred n'interprète que les phrases contenant wake_word. Mettre une chaîne vide pour qu'il réagisse à tout ce qu'il entend. Si une de vos prononciations n'est pas reconnue, regardez la ligne « ignoré, mot de réveil absent » du journal et ajoutez l'orthographe entendue dans wake_word_variants.",
   "edge_voice": "fr-FR-RemyMultilingualNeural",
   "edge_rate": "-5%",
   "edge_pitch": "+0Hz",
+  "wake_word": "alfred",
+  "wake_word_variants": [
+    "alfrède",
+    "alfrèd",
+    "alfrede",
+    "alfredo",
+    "alfret",
+    "alfredd",
+    "alfreed",
+    "halfred",
+    "alfrid",
+    "alfride",
+    "l'fride"
+  ],
   "ollama_model": "llama3.1",
-  "whisper_model": "base"
+  "whisper_model": "base",
+  "_sensibilite": "silence_threshold est le niveau sonore minimum pour qu'Alfred transcrive. Si une télévision ou des conversations le déclenchent, montez-le (0.02, 0.03...) ; s'il n'entend pas une voix douce ou éloignée, baissez-le (0.005). Le journal indique la crête mesurée à chaque écoute ignorée.",
+  "silence_threshold": 0.01
 }
