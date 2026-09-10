@@ -75,6 +75,12 @@ MAX_ECHECS = 5
 SAMPLE_RATE = 16000
 LISTEN_SECONDS = 5
 
+# En dessous de ce niveau crête, on considère qu'il n'y a pas de parole et on
+# ne transcrit pas : sur du silence ou du bruit de fond, Whisper hallucine des
+# phrases entières, que le LLM traduit ensuite en commandes exécutées pour de
+# bon. Alfred tournant en permanence, ce garde-fou est indispensable.
+SILENCE_THRESHOLD = 0.01
+
 # ============ INIT (paresseux : chargé au premier appel) ============
 _whisper_model = None
 _tts_engine = None
@@ -149,10 +155,16 @@ def listen():
         dtype='float32',
     )
     sd.wait()
+    audio = audio.reshape(-1)
+
+    crete = float(abs(audio).max()) if audio.size else 0.0
+    if crete < SILENCE_THRESHOLD:
+        print(f"… silence (crête {crete:.4f}), rien à transcrire")
+        return ""
 
     print("🔄 Transcription...")
     result = _whisper_model.transcribe(
-        audio.reshape(-1), language=CONFIG["language"], fp16=False
+        audio, language=CONFIG["language"], fp16=False
     )
 
     text = result["text"].strip()
