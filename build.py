@@ -36,6 +36,9 @@ def build_exe():
             "--icon", os.path.join("assets", "alfred.ico"),
             "--name", "Alfred",
             "--collect-data", "whisper",
+            # Le monogramme sert d'icône dans la barre des tâches : il doit
+            # être embarqué, sinon on retombe sur une pastille unie.
+            "--add-data", f"{os.path.join('assets', 'alfred.png')}{os.pathsep}assets",
             "--noconfirm",
             "tray_app.py",
         ],

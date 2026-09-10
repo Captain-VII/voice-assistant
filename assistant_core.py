@@ -76,6 +76,34 @@ def _load_settings():
 
 _load_settings()
 
+
+def save_settings(modifications):
+    """Applique des réglages et les écrit dans alfred_settings.json, en
+    conservant les champs d'aide existants. Permet de changer de voix depuis
+    le menu sans perdre le choix au redémarrage."""
+    chemin = os.path.join(BASE_DIR, SETTINGS_FILE)
+
+    contenu = {}
+    if os.path.exists(chemin):
+        try:
+            with open(chemin, encoding="utf-8-sig") as f:
+                charge = json.load(f)
+            if isinstance(charge, dict):
+                contenu = charge
+        except (OSError, ValueError) as e:
+            print(f"⚠️  {SETTINGS_FILE} illisible, il sera réécrit : {e}")
+
+    for cle, valeur in modifications.items():
+        if cle in CONFIG:
+            CONFIG[cle] = valeur
+            contenu[cle] = valeur
+
+    tmp = f"{chemin}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(contenu, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, chemin)
+    print(f"Réglages enregistrés : {modifications}")
+
 # Applications connues (nom prononcé -> argv). Des listes, jamais des chaînes
 # passées à un shell : la cible vient du LLM et ne doit pas pouvoir être
 # interprétée comme une commande.
@@ -129,6 +157,10 @@ SILENCE_THRESHOLD = 0.01
 _whisper_model = None
 _tts_engine = None
 _init_lock = threading.Lock()
+# pygame.mixer.music est une ressource unique : sans ce verrou, un essai de
+# voix lancé depuis le menu et une réponse de la boucle principale se
+# couperaient mutuellement.
+_speak_lock = threading.Lock()
 
 
 def _select_voice(engine):
@@ -327,18 +359,19 @@ def speak(text):
     Ne lève jamais : speak() est appelé depuis les gestionnaires d'erreur de
     la boucle principale, où une exception tuerait le thread."""
     print(f"🔊 {CONFIG['assistant_name']}: {text}")
-    try:
-        _speak_edge(text)
-        return
-    except Exception as e:
-        print(f"⚠️  Voix Edge indisponible ({e}), repli sur la voix locale")
+    with _speak_lock:
+        try:
+            _speak_edge(text)
+            return
+        except Exception as e:
+            print(f"⚠️  Voix Edge indisponible ({e}), repli sur la voix locale")
 
-    try:
-        _ensure_tts()
-        _tts_engine.say(text)
-        _tts_engine.runAndWait()
-    except Exception as e:
-        print(f"⚠️  Voix locale indisponible également : {e}")
+        try:
+            _ensure_tts()
+            _tts_engine.say(text)
+            _tts_engine.runAndWait()
+        except Exception as e:
+            print(f"⚠️  Voix locale indisponible également : {e}")
 
 
 # ============ ACTIONS SYSTEM ============
