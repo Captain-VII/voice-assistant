@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import traceback
 
 
@@ -21,15 +22,58 @@ LOG_PATH = os.path.join(_data_dir(), "alfred.log")
 MAX_LOG_BYTES = 1_000_000
 
 
+class _Journal:
+    """Écrit vers un ou plusieurs flux en préfixant chaque ligne de l'heure.
+    Sans horodatage, aucune latence n'est vérifiable dans le journal, et
+    c'est la lecture du journal de l'exécutable installé qui a révélé les
+    pannes ffmpeg et tqdm."""
+
+    def __init__(self, *flux):
+        self._flux = [f for f in flux if f is not None]
+        self._debut_ligne = True
+        self.encoding = "utf-8"
+
+    def write(self, texte):
+        if not texte:
+            return 0
+        morceaux = []
+        for morceau in str(texte).splitlines(keepends=True):
+            if self._debut_ligne and morceau.strip():
+                morceaux.append(time.strftime("%H:%M:%S "))
+            morceaux.append(morceau)
+            self._debut_ligne = morceau.endswith("\n")
+        sortie = "".join(morceaux)
+        for f in self._flux:
+            try:
+                f.write(sortie)
+            except Exception:
+                pass
+        return len(texte)
+
+    def flush(self):
+        for f in self._flux:
+            try:
+                f.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return False
+
+    def fileno(self):
+        return self._flux[0].fileno()
+
+
 def _redirect_streams():
-    """En build --windowed, sys.stdout et sys.stderr valent None. Sans cette
+    """Journalise tout dans alfred.log, horodaté.
+
+    En build --windowed, sys.stdout et sys.stderr valent None : sans cette
     redirection, tout diagnostic est perdu, et surtout la barre de
     progression tqdm du téléchargement de Whisper lève AttributeError
     (None.write) — ce qui tuait l'assistant au premier lancement sur une
-    machine où le modèle n'était pas encore en cache."""
-    if sys.stdout is not None and sys.stderr is not None:
-        return
-
+    machine où le modèle n'était pas encore en cache. Depuis les sources, la
+    console reste alimentée en plus du journal, et passe en UTF-8 : une
+    console cp1252 faisait planter chaque print contenant un emoji."""
     mode = "a"
     try:
         if os.path.getsize(LOG_PATH) > MAX_LOG_BYTES:
@@ -37,11 +81,19 @@ def _redirect_streams():
     except OSError:
         pass
 
-    flux = open(LOG_PATH, mode, encoding="utf-8", errors="replace", buffering=1)
-    if sys.stdout is None:
-        sys.stdout = flux
-    if sys.stderr is None:
-        sys.stderr = flux
+    fichier = open(LOG_PATH, mode, encoding="utf-8", errors="replace", buffering=1)
+    console = []
+    for flux in (sys.stdout, sys.stderr):
+        if flux is None:
+            continue
+        try:
+            flux.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+        console.append(flux)
+
+    sys.stdout = _Journal(fichier, console[0] if console else None)
+    sys.stderr = _Journal(fichier, console[-1] if console else None)
 
 
 _redirect_streams()
@@ -229,7 +281,10 @@ def toggle_assistant(icon, item):
     if _wanted_active or _est_vivant():
         stop_assistant(icon)
     else:
-        start_assistant(icon)
+        def relancer():
+            _stop_and_wait()
+            start_assistant(icon)
+        threading.Thread(target=relancer, daemon=True).start()
 
 
 def is_active(item):
@@ -363,6 +418,22 @@ def ouvrir_journal(icon, item=None):
     _ouvrir(icon, LOG_PATH, "Journal")
 
 
+# ============ MICRO ============
+def _mesure_micro_target(icon):
+    try:
+        import assistant_core
+        _notify(icon, "Mesure du micro pendant 10 secondes : parlez normalement.")
+        assistant_core.mesure_micro(10)
+        _notify(icon, "Mesure terminée, les niveaux sont dans le journal.")
+    except Exception as e:
+        traceback.print_exc()
+        _notify(icon, f"Mesure du micro impossible : {e}")
+
+
+def tester_micro(icon, item=None):
+    threading.Thread(target=_mesure_micro_target, args=(icon,), daemon=True).start()
+
+
 # ============ MISES À JOUR ============
 def _check_updates_target(icon):
     global _needs_reload
@@ -440,6 +511,7 @@ def main():
         pystray.MenuItem("Débit", _menu_debit()),
         pystray.MenuItem("Ouvrir les réglages…", ouvrir_reglages),
         pystray.MenuItem("Ouvrir le journal…", ouvrir_journal),
+        pystray.MenuItem("Tester le micro…", tester_micro),
         pystray.MenuItem("Démarrer avec Windows", toggle_demarrage, checked=_demarrage_actif),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(lambda item: f"Version {_version()}", None, enabled=False),

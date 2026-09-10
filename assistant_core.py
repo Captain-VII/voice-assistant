@@ -7,20 +7,30 @@ Whisper (STT) + Ollama/llama3.1 (LLM) + edge-tts/pyttsx3 (TTS) + PyAutoGUI (Acti
 import asyncio
 import json
 import os
+import queue
+import random
 import re
 import subprocess
 import sys
 import tempfile
 import threading
+import time
+from collections import deque
 from datetime import datetime
 
 import edge_tts
+import numpy as np
 import pyautogui
 import pygame
 import pyttsx3
 import requests
 import whisper
 from ddgs import DDGS
+
+try:
+    import winsound  # bibliothèque standard, Windows uniquement
+except ImportError:  # pragma: no cover - autre plateforme
+    winsound = None
 
 # ============ CONFIG ============
 CONFIG = {
@@ -43,10 +53,20 @@ CONFIG = {
         "alfrède", "alfrèd", "alfrede", "alfredo", "alfret", "alfredd",
         "alfreed", "halfred", "alfrid", "alfride", "l'fride", "alfredo",
     ],
-    # Niveau crête en dessous duquel on ne transcrit pas. À augmenter si une
-    # télévision ou des conversations à portée de micro déclenchent Alfred,
-    # à diminuer s'il n'entend pas une voix douce ou éloignée.
-    "silence_threshold": 0.01,
+    # Niveau MOYEN (RMS) d'un bloc de 100 ms à partir duquel on considère
+    # qu'on parle. La crête était trop fragile : un clic de clavier la
+    # dépassait et Whisper hallucinait ensuite des phrases entières. Le
+    # niveau moyen d'une pièce calme mesuré ici est 0.0001-0.0004 : 0.005
+    # laisse dix fois de marge sans risquer de manquer une voix normale.
+    "silence_threshold": 0.005,
+    # Silence qui clôt un énoncé, durée maximale d'un énoncé, et âge au-delà
+    # duquel un énoncé capté n'est plus exécuté (une commande périmée
+    # exécutée longtemps après vaut moins que pas de commande).
+    "silence_duration": 0.8,
+    "max_utterance_seconds": 15,
+    "stale_command_seconds": 10,
+    # Bip bref dès que le prénom est reconnu, avant même de réfléchir.
+    "beep_on_wake": True,
 }
 
 SETTINGS_FILE = "alfred_settings.json"
@@ -58,6 +78,8 @@ SETTINGS_FILE = "alfred_settings.json"
 SETTINGS_EXPOSED = (
     "edge_voice", "edge_rate", "edge_pitch",
     "wake_word", "wake_word_variants", "silence_threshold",
+    "silence_duration", "max_utterance_seconds", "stale_command_seconds",
+    "beep_on_wake",
     "ollama_model", "whisper_model",
 )
 
@@ -82,11 +104,20 @@ SETTINGS_HELP = {
         "wake_word_variants."
     ),
     "_sensibilite": (
-        "silence_threshold est le niveau sonore minimum pour qu'Alfred "
-        "transcrive. Si une télévision ou des conversations le déclenchent, "
-        "montez-le (0.02, 0.03...) ; s'il n'entend pas une voix douce ou "
-        "éloignée, baissez-le (0.005). Le journal indique la crête mesurée à "
-        "chaque écoute ignorée."
+        "silence_threshold est le niveau sonore MOYEN (et non plus la crête) "
+        "à partir duquel Alfred considère qu'on parle. Si une télévision ou "
+        "des conversations le déclenchent, montez-le (0.02, 0.03...) ; s'il "
+        "n'entend pas une voix douce ou éloignée, baissez-le (0.005). Pour "
+        "choisir une valeur sur des chiffres réels, utilisez « Tester le "
+        "micro… » dans le menu de l'icône : le journal affiche le niveau "
+        "mesuré pendant dix secondes."
+    ),
+    "_ecoute": (
+        "Alfred écoute en continu. Un énoncé se termine après silence_duration "
+        "secondes de silence, ne dépasse jamais max_utterance_seconds, et n'est "
+        "plus exécuté s'il attend depuis plus de stale_command_seconds (par "
+        "exemple parce qu'Alfred parlait). beep_on_wake : bip bref dès que le "
+        "prénom est reconnu."
     ),
 }
 
@@ -146,6 +177,14 @@ def _sync_settings_file():
 
     attendu = {**SETTINGS_HELP, **{cle: CONFIG[cle] for cle in SETTINGS_EXPOSED}}
     manquants = {cle: val for cle, val in attendu.items() if cle not in contenu}
+
+    # Fichier d'avant l'écoute continue : silence_threshold y désignait une
+    # crête, il désigne maintenant un niveau moyen, nettement plus bas. On ne
+    # migre que l'ancienne valeur par défaut, jamais un réglage personnalisé.
+    if "_ecoute" not in contenu and contenu.get("silence_threshold") == 0.01:
+        manquants["silence_threshold"] = CONFIG["silence_threshold"] = 0.005
+        print("Réglage migré : silence_threshold 0.01 (crête) -> 0.005 (niveau moyen)")
+
     if not manquants:
         return
 
@@ -232,7 +271,19 @@ MAX_ECHECS = 5
 
 # Format attendu par Whisper : mono, 16 kHz, float32.
 SAMPLE_RATE = 16000
-LISTEN_SECONDS = 5
+# Blocs de 100 ms remis par le flux de capture continue.
+BLOCK_SECONDS = 0.1
+BLOCK_SIZE = int(SAMPLE_RATE * BLOCK_SECONDS)
+# Parole minimale pour qu'un énoncé soit transcrit : en dessous, c'est un
+# clic ou une porte qui claque.
+MIN_SPEECH_SECONDS = 0.4
+# Blocs conservés avant le premier bloc de parole : l'attaque d'un mot est
+# plus douce que son milieu, et Whisper la veut pour bien démarrer.
+PRE_ROLL_BLOCKS = 2
+# Énoncés en attente de transcription : au-delà, le plus ancien est jeté.
+MAX_PENDING = 3
+# Segments Whisper au-delà de cette probabilité de « pas de parole » : rejetés.
+NO_SPEECH_MAX = 0.6
 
 # ============ INIT (paresseux : chargé au premier appel) ============
 _whisper_model = None
@@ -242,6 +293,9 @@ _init_lock = threading.Lock()
 # voix lancé depuis le menu et une réponse de la boucle principale se
 # couperaient mutuellement.
 _speak_lock = threading.Lock()
+# stop_event de la boucle en cours, pour que listen() y reste réactif même
+# quand il est appelé depuis _confirm_destructive().
+_stop_event = threading.Event()
 
 
 def _select_voice(engine):
@@ -316,64 +370,266 @@ def _wake_and_command(texte):
     il interprète et exécute pour de bon les conversations et la télévision
     qui passent à portée de micro.
 
-    Le mot de réveil est retiré où qu'il soit, de sorte que « Alfred, quelle
-    heure est-il » comme « arrête, Alfred » fonctionnent. Une commande vide
-    signifie que seul le prénom a été prononcé : l'appelant enchaîne alors
-    sur une seconde écoute."""
+    La commande est ce qui suit le prénom : « Quoi ? Alfred, mets play » donne
+    « mets play », le « Quoi ? » n'étant qu'un préambule. Si rien d'utile ne
+    suit, on garde ce qui précède, pour que « arrête, Alfred » fonctionne
+    aussi. Une commande vide signifie que seul le prénom a été prononcé (ou
+    suivi de mots creux) : l'appelant enchaîne alors sur une seconde écoute."""
     motif = _wake_regex()
     if motif is None:
         return True, texte
 
-    if not motif.search(texte):
+    premier = motif.search(texte)
+    if not premier:
         return False, ""
 
-    reste = re.sub(r"\s+", " ", motif.sub(" ", texte))
-    # Retiré au milieu d'une phrase, le prénom laisse une ponctuation
-    # orpheline : « Dis-moi Alfred, quelle heure » -> « Dis-moi , quelle heure ».
+    avant = _nettoyer_commande(texte[:premier.start()])
+    apres = _nettoyer_commande(motif.sub(" ", texte[premier.end():]))
+    if not _est_appel_seul(apres):
+        return True, apres
+    if not _est_appel_seul(avant):
+        return True, avant
+    return True, ""
+
+
+def _nettoyer_commande(texte):
+    """Espaces et ponctuation orpheline laissés par le retrait du prénom :
+    « Dis-moi , quelle heure » -> « Dis-moi, quelle heure »."""
+    reste = re.sub(r"\s+", " ", texte)
     reste = re.sub(r"\s+([,.;:!?])", r"\1", reste)
-    return True, reste.strip(" ,.;:!?-—…'\"")
+    return reste.strip(" ,.;:!?-—…'\"")
+
+
+# Ce qui reste d'un simple appel une fois le prénom retiré : « Alfred ! Allo ! »
+# n'est pas une commande, c'est quelqu'un qui vérifie qu'on l'écoute.
+_MOTS_CREUX = {
+    "allo", "allô", "oui", "hé", "eh", "hey", "ho", "coucou", "hello", "salut",
+    "tu es là", "t'es là", "es-tu là", "vous êtes là", "êtes-vous là",
+    "dis", "dis-moi", "dites", "dites-moi", "s'il te plaît", "s'il vous plaît",
+}
+
+
+def _est_appel_seul(reste):
+    """Vrai si l'énoncé, prénom retiré, ne contient aucune commande."""
+    n = re.sub(r"[^\w\s'-]", " ", _normalize(reste))
+    n = re.sub(r"\s+", " ", n).strip(" '-")
+    return not n or len(n) < 3 or n in _MOTS_CREUX
 
 
 # ============ SPEECH TO TEXT ============
-def listen():
-    """Écoute le microphone et retourne le texte.
+# Capture continue : le micro reste ouvert en permanence et découpe lui-même
+# les énoncés. L'ancienne fenêtre fixe de 5 s fermait le micro pendant la
+# transcription, le classement et toute la lecture à voix haute : Alfred
+# était sourd la moitié du temps (80 % pendant une réponse de recherche), et
+# la fenêtre s'ouvrait au rythme de la boucle, jamais quand on lui parlait.
+_audio_q = queue.Queue()      # (instant de clôture, tableau float32)
+_capture_stream = None
+_capture_lock = threading.Lock()
+_mute_until = 0.0             # Alfred parle : ce qui entre est ignoré
+_monitor = None               # liste (rms, crête) remplie par mesure_micro
+_capture_state = {
+    "blocs": [], "pre": deque(maxlen=PRE_ROLL_BLOCKS),
+    "actif": False, "parole": 0.0, "silence": 0.0, "erreur_signalee": False,
+}
 
-    L'audio est passé à Whisper sous forme de tableau float32 mono 16 kHz,
-    c'est-à-dire exactement ce que sounddevice produit. Passer par un fichier
-    obligerait Whisper à le décoder avec l'outil externe ffmpeg, absent de la
-    plupart des machines (et de l'installeur) : la transcription échouait
-    alors systématiquement en WinError 2."""
+
+def _reset_capture(etat):
+    etat["blocs"] = []
+    etat["actif"] = False
+    etat["parole"] = 0.0
+    etat["silence"] = 0.0
+
+
+def _enqueue_utterance(audio):
+    """File bornée : on jette le plus ancien, jamais le plus récent."""
+    while _audio_q.qsize() >= MAX_PENDING:
+        try:
+            _audio_q.get_nowait()
+            print("… énoncé en attente écarté, trop de retard")
+        except queue.Empty:
+            break
+    _audio_q.put((time.monotonic(), audio))
+
+
+def _close_utterance(etat):
+    if etat["parole"] >= MIN_SPEECH_SECONDS and etat["blocs"]:
+        _enqueue_utterance(np.concatenate(etat["blocs"]))
+    _reset_capture(etat)
+
+
+def _on_audio(indata, frames, temps, status):
+    """Callback PortAudio, un bloc de 100 ms à la fois. Reste minimal : tout
+    travail lourd ici ferait perdre de l'audio."""
+    etat = _capture_state
+    try:
+        bloc = np.asarray(indata, dtype="float32").reshape(-1).copy()
+        rms = float(np.sqrt(np.mean(bloc * bloc))) if bloc.size else 0.0
+        if _monitor is not None:
+            _monitor.append((rms, float(np.abs(bloc).max()) if bloc.size else 0.0))
+
+        if time.monotonic() < _mute_until:
+            _reset_capture(etat)
+            etat["pre"].clear()
+            return
+
+        seuil = float(CONFIG.get("silence_threshold") or 0.01)
+        duree_bloc = bloc.size / SAMPLE_RATE
+
+        if rms >= seuil:
+            if not etat["actif"]:
+                etat["actif"] = True
+                etat["blocs"].extend(etat["pre"])
+            etat["blocs"].append(bloc)
+            etat["parole"] += duree_bloc
+            etat["silence"] = 0.0
+        elif etat["actif"]:
+            # On garde le souffle de fin de phrase, Whisper coupe mieux ainsi.
+            etat["blocs"].append(bloc)
+            etat["silence"] += duree_bloc
+            if etat["silence"] >= float(CONFIG.get("silence_duration") or 0.8):
+                _close_utterance(etat)
+        else:
+            etat["pre"].append(bloc)
+
+        if etat["actif"]:
+            total = sum(b.size for b in etat["blocs"]) / SAMPLE_RATE
+            if total >= float(CONFIG.get("max_utterance_seconds") or 15):
+                _close_utterance(etat)
+    except Exception as e:  # une exception ici arrêterait le flux en silence
+        if not etat["erreur_signalee"]:
+            etat["erreur_signalee"] = True
+            print(f"❌ Erreur dans la capture audio : {e}")
+
+
+def _start_capture():
+    """Ouvre le flux micro une seule fois ; les appels suivants ne font rien.
+    Retourne True si le flux vient d'être ouvert par cet appel."""
+    global _capture_stream
     import sounddevice as sd
 
-    _ensure_whisper()
+    with _capture_lock:
+        if _capture_stream is not None:
+            return False
+        stream = sd.InputStream(
+            samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+            blocksize=BLOCK_SIZE, callback=_on_audio,
+        )
+        stream.start()
+        _capture_stream = stream
+        print("🎤 Écoute continue ouverte")
+        return True
 
-    print("🎤 Écoute...")
-    audio = sd.rec(
-        int(LISTEN_SECONDS * SAMPLE_RATE),
-        samplerate=SAMPLE_RATE,
-        channels=1,
-        dtype='float32',
-    )
-    sd.wait()
-    audio = audio.reshape(-1)
 
-    # Sur du silence ou du bruit de fond, Whisper hallucine des phrases
-    # entières que le LLM traduit ensuite en commandes exécutées pour de bon.
-    # Alfred tournant en permanence, ce garde-fou est indispensable.
-    crete = float(abs(audio).max()) if audio.size else 0.0
-    seuil = float(CONFIG.get("silence_threshold") or 0.01)
-    if crete < seuil:
-        print(f"… silence (crête {crete:.4f} < seuil {seuil}), rien à transcrire")
-        return ""
+def _stop_capture():
+    global _capture_stream
+    with _capture_lock:
+        stream, _capture_stream = _capture_stream, None
+    if stream is None:
+        return
+    try:
+        stream.stop()
+        stream.close()
+    except Exception as e:
+        print(f"⚠️  Fermeture du micro : {e}")
+    _reset_capture(_capture_state)
+    _drain_queue()
+    print("🎤 Écoute continue fermée")
 
-    print("🔄 Transcription...")
+
+def _drain_queue():
+    while True:
+        try:
+            _audio_q.get_nowait()
+        except queue.Empty:
+            return
+
+
+def _transcribe(audio):
     result = _whisper_model.transcribe(
-        audio, language=CONFIG["language"], fp16=False
+        audio, language=CONFIG["language"], fp16=False,
+        condition_on_previous_text=False, temperature=0.0,
     )
+    # Sur du bruit, Whisper produit des segments qu'il juge lui-même sans
+    # parole : on les écarte au lieu de les envoyer au LLM.
+    segments = list(result.get("segments") or [])
+    gardes = [s for s in segments if float(s.get("no_speech_prob", 0.0)) <= NO_SPEECH_MAX]
+    if segments and not gardes:
+        return ""
+    if gardes:
+        return " ".join(str(s.get("text", "")).strip() for s in gardes).strip()
+    return str(result.get("text", "")).strip()
 
-    text = result["text"].strip()
+
+def listen(timeout=None):
+    """Attend le prochain énoncé capté et retourne sa transcription.
+
+    Retourne "" si stop_event est levé, si `timeout` secondes s'écoulent sans
+    rien entendre, ou si Whisper ne trouve pas de parole. Les énoncés plus
+    vieux que stale_command_seconds sont jetés : une commande exécutée bien
+    après avoir été prononcée est précisément le symptôme qu'on corrige.
+
+    L'audio est passé à Whisper sous forme de tableau float32 mono 16 kHz.
+    Passer par un fichier l'obligerait à décoder avec ffmpeg, absent de la
+    plupart des machines : la transcription échouait alors en WinError 2."""
+    _ensure_whisper()
+    _start_capture()
+
+    limite = None if timeout is None else time.monotonic() + timeout
+    while True:
+        if _stop_event.is_set():
+            return ""
+        if limite is not None and time.monotonic() >= limite:
+            return ""
+        try:
+            capte, audio = _audio_q.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        age = time.monotonic() - capte
+        peremption = float(CONFIG.get("stale_command_seconds") or 10)
+        if age > peremption:
+            print(f"… énoncé périmé ({age:.1f} s > {peremption:g} s), ignoré")
+            continue
+        break
+
+    print(f"🔄 Transcription ({audio.size / SAMPLE_RATE:.1f} s)...")
+    text = _transcribe(audio)
     print(f"📝 Vous: {text}")
     return text
+
+
+def mesure_micro(secondes=10):
+    """Affiche le niveau moyen par bloc de 100 ms pendant `secondes`, puis un
+    résumé, pour régler silence_threshold sur des chiffres réels."""
+    global _monitor
+    ouvert_ici = _start_capture()
+    _monitor = []
+    try:
+        print(f"🎚️  Mesure du micro pendant {secondes} s (parlez normalement)…")
+        fin = time.monotonic() + secondes
+        while time.monotonic() < fin:
+            time.sleep(0.1)
+        mesures = list(_monitor)
+    finally:
+        _monitor = None
+        if ouvert_ici:
+            _stop_capture()
+
+    seuil = float(CONFIG.get("silence_threshold") or 0.01)
+    for i in range(0, len(mesures), 10):
+        tranche = mesures[i:i + 10]
+        print(f"  {i / 10:4.1f} s  moyen " + " ".join(f"{r:.4f}" for r, _ in tranche)
+              + "  crête " + f"{max(c for _, c in tranche):.3f}")
+    if mesures:
+        rms = sorted(r for r, _ in mesures)
+        fond = rms[len(rms) // 10]
+        pic = rms[-1]
+        print(f"🎚️  Fond sonore ≈ {fond:.4f}, parole max ≈ {pic:.4f}, "
+              f"seuil actuel {seuil:g} (blocs au-dessus : "
+              f"{sum(1 for r in rms if r >= seuil)}/{len(rms)})")
+        if pic >= 0.005 and pic > fond * 3:
+            print(f"🎚️  Suggestion de seuil : {(fond * 2 + pic * 0.15):.4f}")
+        else:
+            print("🎚️  Aucune parole nette détectée pendant la mesure : parlez au micro pour obtenir une suggestion.")
 
 
 # ============ LLM ENGINE ============
@@ -540,20 +796,43 @@ def speak(text):
 
     Ne lève jamais : speak() est appelé depuis les gestionnaires d'erreur de
     la boucle principale, où une exception tuerait le thread."""
+    global _mute_until
     print(f"🔊 {CONFIG['assistant_name']}: {text}")
     with _speak_lock:
+        # Sourdine le temps de parler : Alfred ne doit ni s'entendre, ni
+        # traiter ce qui a été capté pendant qu'il parlait. Placé ici et non
+        # dans _speak_edge pour couvrir aussi le repli pyttsx3.
+        _mute_until = float("inf")
         try:
-            _speak_edge(text)
-            return
-        except Exception as e:
-            print(f"⚠️  Voix Edge indisponible ({e}), repli sur la voix locale")
+            try:
+                _speak_edge(text)
+                return
+            except Exception as e:
+                print(f"⚠️  Voix Edge indisponible ({e}), repli sur la voix locale")
 
-        try:
-            _ensure_tts()
-            _tts_engine.say(text)
-            _tts_engine.runAndWait()
-        except Exception as e:
-            print(f"⚠️  Voix locale indisponible également : {e}")
+            try:
+                _ensure_tts()
+                _tts_engine.say(text)
+                _tts_engine.runAndWait()
+            except Exception as e:
+                print(f"⚠️  Voix locale indisponible également : {e}")
+        finally:
+            _mute_until = time.monotonic() + 0.4
+            _drain_queue()
+
+
+def _bip():
+    """Accusé de réception instantané dès que le prénom est reconnu, avant
+    même de réfléchir. Un bip et non une phrase : une parole d'Alfred
+    couperait celle de l'utilisateur."""
+    global _mute_until
+    if not CONFIG.get("beep_on_wake", True) or winsound is None:
+        return
+    _mute_until = time.monotonic() + 0.3
+    try:
+        winsound.Beep(880, 120)
+    except Exception as e:
+        print(f"⚠️  Bip impossible : {e}")
 
 
 # ============ ACTIONS SYSTEM ============
@@ -589,6 +868,58 @@ def _close_app(target):
         return False
     resultat = subprocess.run(["taskkill", "/IM", f"{nom}.exe", "/F"], capture_output=True)
     return resultat.returncode == 0
+
+
+# Commandes courantes reconnues sans passer par le modèle : llama3.1 classait
+# « mets play sur la vidéo » en ouverture d'application, et chaque passage
+# par lui coûte plus d'une seconde. Tout ce qui ne correspond pas continue
+# vers interpret_command() sans changement.
+_ROUTES_DIRECTES = (
+    (re.compile(r"\b(monte|augmente|hausse|plus fort)\b"), "volume_up"),
+    (re.compile(r"\b(baisse|diminue|réduis|moins fort)\b"), "volume_down"),
+    (re.compile(r"\b(suivante?|prochaine?|d'après|skip|passe)\b"), "next_track"),
+    (re.compile(r"\b(précédente?|d'avant|reviens en arrière|recule)\b"), "prev_track"),
+    (re.compile(r"\b(play|pause|lecture|reprends?|relance|continue|"
+                r"(re)?mets?( la| le)?( musique| vidéo| son| film)|"
+                r"(arr[êe]te|stoppe?|coupe)( la| le)( musique| vidéo| son| film))\b"),
+     "play_pause"),
+    (re.compile(r"\b(quelle heure|l'heure|il est quelle heure|heure est-il)\b"), "time"),
+)
+_MOTIF_OUVRIR = re.compile(
+    r"\b(?:ouvre|ouvrir|lance|lancer|démarre|démarrer|affiche)\s+"
+    r"(?:le |la |l'|les |mon |ma |mes |un |une )?(.+)$"
+)
+
+_REPONSES_DIRECTES = {
+    "play_pause": ("C'est fait, monsieur.", "Voilà qui est fait.",
+                   "À votre convenance, monsieur."),
+    "next_track": ("Piste suivante, monsieur.", "Passons à la suivante."),
+    "prev_track": ("Piste précédente, monsieur.", "Revenons en arrière."),
+    "volume_up": ("Un peu plus fort, monsieur.", "Je monte le son."),
+    "volume_down": ("Un peu moins fort, monsieur.", "Je baisse le son."),
+    "time": ("",),
+    "open_app": ("{app} arrive à l'instant, monsieur.", "J'ouvre {app} pour vous."),
+}
+
+
+def _route_directe(texte):
+    """(action, cible, réponse) pour une commande courante, ou None si elle
+    doit passer par le modèle."""
+    n = _normalize(texte)
+    if not n:
+        return None
+
+    for motif, action in _ROUTES_DIRECTES:
+        if motif.search(n):
+            return action, "", random.choice(_REPONSES_DIRECTES[action])
+
+    m = _MOTIF_OUVRIR.search(n)
+    if m:
+        cible = m.group(1).strip(" ,.;:!?'\"")
+        if _app_key(cible) in _APPS_INDEX:
+            return ("open_app", cible,
+                    random.choice(_REPONSES_DIRECTES["open_app"]).format(app=cible.capitalize()))
+    return None
 
 
 def execute_action(action, target):
@@ -643,7 +974,7 @@ def _confirm_destructive(action):
     """Demande une confirmation vocale explicite avant une action irréversible."""
     libelle = "éteindre l'ordinateur" if action == "shutdown" else "redémarrer l'ordinateur"
     speak(f"Confirmez-vous que je dois {libelle} ? Dites oui pour valider.")
-    reponse = _normalize(listen())
+    reponse = _normalize(listen(timeout=8))
     print(f"Confirmation entendue : {reponse!r}")
     return any(mot in reponse for mot in CONFIRM_WORDS)
 
@@ -652,8 +983,10 @@ def _confirm_destructive(action):
 def run(stop_event=None):
     """Boucle principale de l'assistant. S'arrête dès que stop_event est levé
     (si fourni), sinon tourne jusqu'à un mot d'arrêt vocal ou Ctrl+C."""
+    global _stop_event
     if stop_event is None:
         stop_event = threading.Event()
+    _stop_event = stop_event
 
     print("=" * 50)
     print(f"🎙️  {CONFIG['assistant_name'].upper()} - ASSISTANT VOCAL LOCAL")
@@ -668,68 +1001,87 @@ def run(stop_event=None):
               f"Dites-moi ce dont vous avez besoin.")
 
     echecs = 0
-    while not stop_event.is_set():
-        try:
-            user_input = listen()
+    try:
+        while not stop_event.is_set():
+            echecs = _tour_de_boucle(stop_event, echecs)
+            if echecs is None:
+                break
+    finally:
+        _stop_capture()
 
+
+def _tour_de_boucle(stop_event, echecs):
+    """Un énoncé traité. Retourne le nouveau compteur d'échecs, ou None pour
+    arrêter la boucle."""
+    try:
+        user_input = listen()
+
+        if stop_event.is_set():
+            return None
+
+        if not user_input:
+            return echecs
+
+        reveille, commande_texte = _wake_and_command(user_input)
+        if not reveille:
+            print(f"… ignoré, mot de réveil absent : {user_input!r}")
+            return echecs
+
+        _bip()
+
+        if not commande_texte:
+            # Seul le prénom a été prononcé : on acquitte et on attend la
+            # commande, un énoncé entier cette fois.
+            speak("Oui monsieur, je vous écoute.")
+            commande_texte = listen(timeout=8)
             if stop_event.is_set():
-                break
+                return None
+            if not commande_texte or _est_appel_seul(commande_texte):
+                return echecs
 
-            if not user_input:
-                continue
+        if _normalize(commande_texte) in STOP_PHRASES:
+            speak("Très bien, je reste à votre entière disposition.")
+            return None
 
-            reveille, commande_texte = _wake_and_command(user_input)
-            if not reveille:
-                print(f"… ignoré, mot de réveil absent : {user_input!r}")
-                continue
-
-            if not commande_texte:
-                # Seul le prénom a été prononcé : on acquitte et on écoute la
-                # commande, qui dispose ainsi d'une fenêtre complète.
-                speak("Oui monsieur, je vous écoute.")
-                commande_texte = listen()
-                if stop_event.is_set():
-                    break
-                if not commande_texte:
-                    continue
-
-            if _normalize(commande_texte) in STOP_PHRASES:
-                speak("Très bien, je reste à votre entière disposition.")
-                break
-
+        directe = _route_directe(commande_texte)
+        if directe:
+            action, target, response = directe
+            print(f"⚡ Commande directe : {action} {target!r}")
+        else:
             command = interpret_command(commande_texte)
             action = str(command.get("action") or "help")
             target = str(command.get("target") or "")
             response = str(command.get("response") or "Commande non reconnue")
 
-            if action in DESTRUCTIVE_ACTIONS and not _confirm_destructive(action):
-                speak("Fort bien, je n'y touche pas.")
-                continue
+        if action in DESTRUCTIVE_ACTIONS and not _confirm_destructive(action):
+            speak("Fort bien, je n'y touche pas.")
+            return echecs
 
-            resultat = execute_action(action, target)
-            if action == "time" and resultat:
-                response = f"Il est {resultat}, monsieur."
-            elif action == "web_search" and resultat:
-                response = resultat
-            elif resultat is False:
-                response = "Je n'ai pas pu m'en occuper, monsieur."
-            speak(response)
+        resultat = execute_action(action, target)
+        if action == "time" and resultat:
+            response = f"Il est {resultat}, monsieur."
+        elif action == "web_search" and resultat:
+            response = resultat
+        elif resultat is False:
+            response = "Je n'ai pas pu m'en occuper, monsieur."
+        speak(response)
+        return 0
 
-            echecs = 0
+    except KeyboardInterrupt:
+        speak("Fort bien, je me retire pour cette fois.")
+        return None
+    except Exception as e:
+        echecs += 1
+        print(f"Erreur (échec {echecs}/{MAX_ECHECS}) : {e}")
+        if echecs == 1:
+            speak("Toutes mes excuses, un contretemps est survenu.")
+        if echecs >= MAX_ECHECS:
+            speak("Je rencontre un problème persistant, je me mets en veille.")
+            raise RuntimeError(f"{echecs} échecs consécutifs, dernier : {e}") from e
+        # Attente croissante, interruptible par une demande d'arrêt.
+        stop_event.wait(min(2 ** echecs, 30))
+        return echecs
 
-        except KeyboardInterrupt:
-            speak("Fort bien, je me retire pour cette fois.")
-            break
-        except Exception as e:
-            echecs += 1
-            print(f"Erreur (échec {echecs}/{MAX_ECHECS}) : {e}")
-            if echecs == 1:
-                speak("Toutes mes excuses, un contretemps est survenu.")
-            if echecs >= MAX_ECHECS:
-                speak("Je rencontre un problème persistant, je me mets en veille.")
-                raise RuntimeError(f"{echecs} échecs consécutifs, dernier : {e}") from e
-            # Attente croissante, interruptible par une demande d'arrêt.
-            stop_event.wait(min(2 ** echecs, 30))
 
 
 if __name__ == "__main__":

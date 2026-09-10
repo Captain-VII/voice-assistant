@@ -96,6 +96,9 @@ def check_and_update(base_dir):
         manifest = resp.json()
     except (requests.exceptions.RequestException, ValueError):
         return False
+    if not isinstance(manifest, dict):
+        print("Manifeste invalide (pas un objet JSON) : mise à jour ignorée.")
+        return False
 
     remote_version = manifest.get("version", "0.0.0")
     script_url = manifest.get("script_url")
