@@ -20,6 +20,7 @@ import pygame
 import pyttsx3
 import requests
 import whisper
+from ddgs import DDGS
 
 # ============ CONFIG ============
 CONFIG = {
@@ -270,6 +271,53 @@ def query_ollama(prompt):
         return None
 
 
+# ============ RECHERCHE WEB ============
+def web_search(query, max_results=5):
+    """Cherche sur DuckDuckGo et retourne une liste d'extraits (title/href/body).
+
+    Ne lève jamais : sans internet, ou si DuckDuckGo limite les requêtes
+    automatisées (ça arrive), retourne simplement une liste vide plutôt que
+    de faire planter le thread principal."""
+    try:
+        return DDGS().text(query, max_results=max_results, region="fr-fr")
+    except Exception as e:
+        print(f"❌ Recherche web impossible : {e}")
+        return []
+
+
+def _synthesize_search_answer(query, resultats):
+    """Rédige, à partir des extraits trouvés, une réponse orale dans la
+    personnalité d'Alfred. Retourne None si rien à synthétiser."""
+    if not resultats:
+        return None
+
+    extraits = "\n".join(
+        f"- {r.get('title', '')} : {r.get('body', '')}" for r in resultats
+    )
+    prompt = f"""{PERSONA.format(name=CONFIG['assistant_name'])}
+
+L'utilisateur a demandé : "{query}"
+
+Voici des extraits de résultats de recherche web trouvés à ce sujet :
+{extraits}
+
+Rédige la réponse orale que tu vas prononcer, en te basant uniquement sur ces
+extraits. Contrairement à tes autres réponses habituellement très brèves,
+ici tu peux prendre 2 à 4 phrases si l'information le demande, toujours dans
+ta personnalité de majordome. Ne mentionne ni le mot "extrait" ni le mot
+"recherche" : parle comme si tu savais déjà la réponse. Réponds uniquement
+avec le texte à prononcer, sans JSON ni balises."""
+
+    return query_ollama(prompt)
+
+
+def answer_from_search(query):
+    """Cherche sur le web puis synthétise une réponse orale. Retourne None si
+    la recherche n'a rien donné ou si Ollama est injoignable."""
+    resultats = web_search(query)
+    return _synthesize_search_answer(query, resultats)
+
+
 PERSONA = """Tu es {name}, un majordome anglais d'une soixantaine d'années, au service de l'utilisateur \
 depuis de nombreuses années. Tu es calme, courtois, un brin pince-sans-rire, et tu vouvoies toujours \
 l'utilisateur. Tes réponses sont brèves (une phrase, deux maximum) mais jamais froides ni robotiques : \
@@ -290,12 +338,19 @@ Réponds UNIQUEMENT en JSON avec ces champs, sans texte autour ni balises markdo
 {{"action": "type_action", "target": "cible", "response": "ta réponse vocale, dans ta personnalité"}}
 
 Actions possibles: play_pause, next_track, prev_track, volume_up, volume_down,
-open_app, close_app, shutdown, restart, time, help
+open_app, close_app, shutdown, restart, time, web_search, help
+
+Utilise web_search pour toute question dont tu ne peux pas connaître la
+réponse avec certitude (météo, actualité, résultat sportif, information
+récente ou précise sur une personne, un lieu, un événement...). Dans ce cas,
+"target" doit être une requête de recherche courte et précise, pas la phrase
+de l'utilisateur telle quelle.
 
 Exemple:
 - "pause la musique" → {{"action": "play_pause", "target": "", "response": "Musique en pause, comme vous le souhaitiez."}}
 - "ouvre firefox" → {{"action": "open_app", "target": "firefox", "response": "Firefox arrive à l'instant, monsieur."}}
 - "quelle heure" → {{"action": "time", "target": "", "response": "Il est 14h30"}}
+- "quel temps fait-il à Lyon" → {{"action": "web_search", "target": "météo Lyon aujourd'hui", "response": "Je me renseigne, monsieur."}}
 
 Réponds maintenant en JSON uniquement:"""
 
@@ -448,6 +503,9 @@ def execute_action(action, target):
         elif action == "time":
             return datetime.now().strftime("%H:%M")
 
+        elif action == "web_search":
+            return answer_from_search(target) or False
+
         return True
     except Exception as e:
         print(f"❌ Erreur exécution: {e}")
@@ -504,6 +562,8 @@ def run(stop_event=None):
             resultat = execute_action(action, target)
             if action == "time" and resultat:
                 response = f"Il est {resultat}, monsieur."
+            elif action == "web_search" and resultat:
+                response = resultat
             elif resultat is False:
                 response = "Je n'ai pas pu m'en occuper, monsieur."
             speak(response)

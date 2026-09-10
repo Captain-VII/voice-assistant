@@ -8,3 +8,4 @@ pillow
 edge-tts
 pygame
 pywin32
+ddgs
