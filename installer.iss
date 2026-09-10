@@ -39,6 +39,9 @@ Source: "dist\Alfred\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs c
 ; lue comme « 0.0.0 » et la vérification de mise à jour est désactivée.
 Source: "version.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "update_config.json"; DestDir: "{app}"; Flags: onlyifdoesntexist
+; Réglages éditables (voix, débit, modèles) : onlyifdoesntexist pour ne pas
+; écraser les choix de l'utilisateur lors d'une mise à jour.
+Source: "alfred_settings.json"; DestDir: "{app}"; Flags: onlyifdoesntexist
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

@@ -9,6 +9,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 from datetime import datetime
@@ -28,9 +29,49 @@ CONFIG = {
     "whisper_model": "base",
     "language": "fr",
     "edge_voice": "fr-FR-RemyMultilingualNeural",  # voix masculine française (nécessite internet)
-    "edge_rate": "-8%",
-    "edge_pitch": "-3Hz",
+    "edge_rate": "-5%",
+    # Volontairement neutre : tout décalage de ton par edge-tts s'entend comme
+    # un traitement artificiel. Pour une voix plus posée, ralentir edge_rate.
+    "edge_pitch": "+0Hz",
 }
+
+SETTINGS_FILE = "alfred_settings.json"
+
+if getattr(sys, "frozen", False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _load_settings():
+    """Applique les réglages trouvés à côté de l'exécutable, pour pouvoir
+    changer de voix ou de débit sans reconstruire l'application."""
+    chemin = os.path.join(BASE_DIR, SETTINGS_FILE)
+    if not os.path.exists(chemin):
+        return
+
+    try:
+        with open(chemin, encoding="utf-8") as f:
+            reglages = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"⚠️  Réglages ignorés, {SETTINGS_FILE} illisible : {e}")
+        return
+
+    if not isinstance(reglages, dict):
+        print(f"⚠️  Réglages ignorés, {SETTINGS_FILE} n'est pas un objet JSON")
+        return
+
+    for cle, valeur in reglages.items():
+        if cle.startswith("_"):
+            continue  # champs d'aide, non appliqués
+        if cle in CONFIG:
+            CONFIG[cle] = valeur
+            print(f"Réglage appliqué : {cle} = {valeur!r}")
+        else:
+            print(f"⚠️  Réglage inconnu ignoré : {cle}")
+
+
+_load_settings()
 
 # Applications connues (nom prononcé -> argv). Des listes, jamais des chaînes
 # passées à un shell : la cible vient du LLM et ne doit pas pouvoir être

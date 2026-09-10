@@ -1,0 +1,10 @@
+{
+  "_aide": "Modifiez ces valeurs puis relancez Alfred. Aucune reconstruction nécessaire.",
+  "_voix_masculines": "fr-FR-RemyMultilingualNeural, fr-FR-HenriNeural, fr-BE-GerardNeural, fr-CH-FabriceNeural, fr-CA-ThierryNeural, fr-CA-JeanNeural, fr-CA-AntoineNeural, en-US-AndrewMultilingualNeural, en-AU-WilliamMultilingualNeural",
+  "_ton": "Laisser edge_pitch à +0Hz : tout décalage de ton par edge-tts s'entend comme un traitement artificiel. Pour une voix plus posée, ralentir edge_rate (par exemple -8%).",
+  "edge_voice": "fr-FR-RemyMultilingualNeural",
+  "edge_rate": "-5%",
+  "edge_pitch": "+0Hz",
+  "ollama_model": "llama3.1",
+  "whisper_model": "base"
+}
