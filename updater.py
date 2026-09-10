@@ -39,7 +39,8 @@ def _read_local_version(base_dir):
     path = os.path.join(base_dir, VERSION_FILE)
     if not os.path.exists(path):
         return "0.0.0"
-    with open(path, encoding="utf-8") as f:
+    # utf-8-sig : tolère le BOM ajouté par les éditeurs Windows.
+    with open(path, encoding="utf-8-sig") as f:
         return f.read().strip()
 
 
@@ -47,8 +48,12 @@ def _read_manifest_url(base_dir):
     path = os.path.join(base_dir, CONFIG_FILE)
     if not os.path.exists(path):
         return None
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"{CONFIG_FILE} illisible, vérification des mises à jour ignorée : {e}")
+        return None
     return data.get("manifest_url") or None
 
 

@@ -51,7 +51,10 @@ def _load_settings():
         return
 
     try:
-        with open(chemin, encoding="utf-8") as f:
+        # utf-8-sig : le Bloc-notes de Windows ajoute un BOM en enregistrant,
+        # ce qui ferait échouer la lecture et ignorer silencieusement les
+        # réglages que l'utilisateur vient de modifier.
+        with open(chemin, encoding="utf-8-sig") as f:
             reglages = json.load(f)
     except (OSError, ValueError) as e:
         print(f"⚠️  Réglages ignorés, {SETTINGS_FILE} illisible : {e}")
