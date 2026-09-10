@@ -21,12 +21,14 @@
     "l'fride"
   ],
   "ollama_model": "llama3.1",
-  "whisper_model": "base",
+  "whisper_model": "small",
   "_sensibilite": "silence_threshold est le niveau sonore minimum pour qu'Alfred transcrive. Si une télévision ou des conversations le déclenchent, montez-le (0.02, 0.03...) ; s'il n'entend pas une voix douce ou éloignée, baissez-le (0.005). Le journal indique la crête mesurée à chaque écoute ignorée.",
   "silence_threshold": 0.005,
   "_ecoute": "Alfred écoute en continu. Un énoncé se termine après silence_duration secondes de silence, ne dépasse jamais max_utterance_seconds, et n'est plus exécuté s'il attend depuis plus de stale_command_seconds (par exemple parce qu'Alfred parlait). beep_on_wake : bip bref dès que le prénom est reconnu.",
-  "silence_duration": 0.8,
+  "silence_duration": 1.0,
   "max_utterance_seconds": 15,
   "stale_command_seconds": 10,
-  "beep_on_wake": true
+  "beep_on_wake": true,
+  "_modele": "whisper_model : « base » est rapide mais fait beaucoup d'erreurs en français ; « small » en fait deux fois moins pour moins d'une seconde de transcription. « medium » est plus précis encore mais lent sans carte graphique. Le modèle est téléchargé au premier lancement.",
+  "speech_hold_ratio": 0.3
 }

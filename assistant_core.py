@@ -37,7 +37,9 @@ CONFIG = {
     "assistant_name": "Alfred",
     "ollama_host": "http://localhost:11434",
     "ollama_model": "llama3.1",
-    "whisper_model": "base",
+    # « small » : deux fois moins d'erreurs qu'avec « base » en français, pour
+    # 0,7 s de transcription sur cette machine (contre 0,2 s).
+    "whisper_model": "small",
     "language": "fr",
     "edge_voice": "fr-FR-RemyMultilingualNeural",  # voix masculine française (nécessite internet)
     "edge_rate": "-5%",
@@ -59,10 +61,15 @@ CONFIG = {
     # niveau moyen d'une pièce calme mesuré ici est 0.0001-0.0004 : 0.005
     # laisse dix fois de marge sans risquer de manquer une voix normale.
     "silence_threshold": 0.005,
+    # Une fois la parole engagée, on reste « en parole » tant que le niveau
+    # dépasse cette fraction du seuil : les creux entre syllabes (mesurés à
+    # 0.002-0.005 pour une voix qui monte à 0.04) coupaient les phrases en
+    # morceaux de deux secondes.
+    "speech_hold_ratio": 0.3,
     # Silence qui clôt un énoncé, durée maximale d'un énoncé, et âge au-delà
     # duquel un énoncé capté n'est plus exécuté (une commande périmée
     # exécutée longtemps après vaut moins que pas de commande).
-    "silence_duration": 0.8,
+    "silence_duration": 1.0,
     "max_utterance_seconds": 15,
     "stale_command_seconds": 10,
     # Bip bref dès que le prénom est reconnu, avant même de réfléchir.
@@ -78,7 +85,7 @@ SETTINGS_FILE = "alfred_settings.json"
 SETTINGS_EXPOSED = (
     "edge_voice", "edge_rate", "edge_pitch",
     "wake_word", "wake_word_variants", "silence_threshold",
-    "silence_duration", "max_utterance_seconds", "stale_command_seconds",
+    "speech_hold_ratio", "silence_duration", "max_utterance_seconds", "stale_command_seconds",
     "beep_on_wake",
     "ollama_model", "whisper_model",
 )
@@ -112,9 +119,17 @@ SETTINGS_HELP = {
         "micro… » dans le menu de l'icône : le journal affiche le niveau "
         "mesuré pendant dix secondes."
     ),
+    "_modele": (
+        "whisper_model : « base » est rapide mais fait beaucoup d'erreurs en "
+        "français ; « small » en fait deux fois moins pour moins d'une seconde "
+        "de transcription. « medium » est plus précis encore mais lent sans "
+        "carte graphique. Le modèle est téléchargé au premier lancement."
+    ),
     "_ecoute": (
         "Alfred écoute en continu. Un énoncé se termine après silence_duration "
-        "secondes de silence, ne dépasse jamais max_utterance_seconds, et n'est "
+        "secondes de silence (speech_hold_ratio : fraction du seuil en dessous "
+        "de laquelle un creux compte comme du silence une fois la parole "
+        "engagée), ne dépasse jamais max_utterance_seconds, et n'est "
         "plus exécuté s'il attend depuis plus de stale_command_seconds (par "
         "exemple parce qu'Alfred parlait). beep_on_wake : bip bref dès que le "
         "prénom est reconnu."
@@ -184,6 +199,12 @@ def _sync_settings_file():
     if "_ecoute" not in contenu and contenu.get("silence_threshold") == 0.01:
         manquants["silence_threshold"] = CONFIG["silence_threshold"] = 0.005
         print("Réglage migré : silence_threshold 0.01 (crête) -> 0.005 (niveau moyen)")
+    if "_modele" not in contenu:
+        if contenu.get("whisper_model") == "base":
+            manquants["whisper_model"] = CONFIG["whisper_model"] = "small"
+            print("Réglage migré : whisper_model base -> small (précision en français)")
+        if contenu.get("silence_duration") == 0.8:
+            manquants["silence_duration"] = CONFIG["silence_duration"] = 1.0
 
     if not manquants:
         return
@@ -429,15 +450,15 @@ _mute_until = 0.0             # Alfred parle : ce qui entre est ignoré
 _monitor = None               # liste (rms, crête) remplie par mesure_micro
 _capture_state = {
     "blocs": [], "pre": deque(maxlen=PRE_ROLL_BLOCKS),
-    "actif": False, "parole": 0.0, "silence": 0.0, "erreur_signalee": False,
+    "actif": False, "parole": 0, "silence": 0, "erreur_signalee": False,
 }
 
 
 def _reset_capture(etat):
     etat["blocs"] = []
     etat["actif"] = False
-    etat["parole"] = 0.0
-    etat["silence"] = 0.0
+    etat["parole"] = 0
+    etat["silence"] = 0
 
 
 def _enqueue_utterance(audio):
@@ -452,7 +473,7 @@ def _enqueue_utterance(audio):
 
 
 def _close_utterance(etat):
-    if etat["parole"] >= MIN_SPEECH_SECONDS and etat["blocs"]:
+    if etat["parole"] >= MIN_SPEECH_SECONDS * SAMPLE_RATE and etat["blocs"]:
         _enqueue_utterance(np.concatenate(etat["blocs"]))
     _reset_capture(etat)
 
@@ -473,27 +494,29 @@ def _on_audio(indata, frames, temps, status):
             return
 
         seuil = float(CONFIG.get("silence_threshold") or 0.01)
-        duree_bloc = bloc.size / SAMPLE_RATE
-
+        if etat["actif"]:
+            seuil *= float(CONFIG.get("speech_hold_ratio") or 0.3)
+        # Durées comptées en échantillons : en flottant, dix blocs de 0,1 s
+        # font 0,9999999 s et une clôture réglée à 1 s n'arrivait jamais.
         if rms >= seuil:
             if not etat["actif"]:
                 etat["actif"] = True
                 etat["blocs"].extend(etat["pre"])
             etat["blocs"].append(bloc)
-            etat["parole"] += duree_bloc
-            etat["silence"] = 0.0
+            etat["parole"] += bloc.size
+            etat["silence"] = 0
         elif etat["actif"]:
             # On garde le souffle de fin de phrase, Whisper coupe mieux ainsi.
             etat["blocs"].append(bloc)
-            etat["silence"] += duree_bloc
-            if etat["silence"] >= float(CONFIG.get("silence_duration") or 0.8):
+            etat["silence"] += bloc.size
+            if etat["silence"] >= float(CONFIG.get("silence_duration") or 1.0) * SAMPLE_RATE:
                 _close_utterance(etat)
         else:
             etat["pre"].append(bloc)
 
         if etat["actif"]:
-            total = sum(b.size for b in etat["blocs"]) / SAMPLE_RATE
-            if total >= float(CONFIG.get("max_utterance_seconds") or 15):
+            total = sum(b.size for b in etat["blocs"])
+            if total >= float(CONFIG.get("max_utterance_seconds") or 15) * SAMPLE_RATE:
                 _close_utterance(etat)
     except Exception as e:  # une exception ici arrêterait le flux en silence
         if not etat["erreur_signalee"]:
@@ -1030,10 +1053,15 @@ def _tour_de_boucle(stop_event, echecs):
         _bip()
 
         if not commande_texte:
-            # Seul le prénom a été prononcé : on acquitte et on attend la
-            # commande, un énoncé entier cette fois.
-            speak("Oui monsieur, je vous écoute.")
-            commande_texte = listen(timeout=8)
+            # Seul le prénom a été prononcé. On attend d'abord la suite en
+            # silence : dire « Oui monsieur » tout de suite coupait le micro
+            # juste au moment où l'utilisateur enchaînait, et sa commande
+            # était perdue. On ne parle que s'il ne dit vraiment rien.
+            commande_texte = listen(timeout=2.5)
+            if not commande_texte and not _capture_state["actif"]:
+                speak("Oui monsieur, je vous écoute.")
+            if not commande_texte:
+                commande_texte = listen(timeout=8)
             if stop_event.is_set():
                 return None
             if not commande_texte or _est_appel_seul(commande_texte):
