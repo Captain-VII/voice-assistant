@@ -3,7 +3,6 @@ pyttsx3
 pyautogui
 requests
 sounddevice
-soundfile
 pystray
 pillow
 edge-tts

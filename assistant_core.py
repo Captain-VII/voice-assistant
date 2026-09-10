@@ -71,6 +71,10 @@ _SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _.\-]{0,63}")
 # boucler indéfiniment quand la panne est permanente (micro absent, etc.).
 MAX_ECHECS = 5
 
+# Format attendu par Whisper : mono, 16 kHz, float32.
+SAMPLE_RATE = 16000
+LISTEN_SECONDS = 5
+
 # ============ INIT (paresseux : chargé au premier appel) ============
 _whisper_model = None
 _tts_engine = None
@@ -126,29 +130,30 @@ def _normalize(texte):
 
 # ============ SPEECH TO TEXT ============
 def listen():
-    """Écoute le microphone et retourne le texte"""
+    """Écoute le microphone et retourne le texte.
+
+    L'audio est passé à Whisper sous forme de tableau float32 mono 16 kHz,
+    c'est-à-dire exactement ce que sounddevice produit. Passer par un fichier
+    obligerait Whisper à le décoder avec l'outil externe ffmpeg, absent de la
+    plupart des machines (et de l'installeur) : la transcription échouait
+    alors systématiquement en WinError 2."""
     import sounddevice as sd
-    import soundfile as sf
 
     _ensure_whisper()
 
     print("🎤 Écoute...")
-    duration = 5
-    sample_rate = 16000
-    audio = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1, dtype='float32')
+    audio = sd.rec(
+        int(LISTEN_SECONDS * SAMPLE_RATE),
+        samplerate=SAMPLE_RATE,
+        channels=1,
+        dtype='float32',
+    )
     sd.wait()
 
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        audio_path = tmp.name
-    try:
-        sf.write(audio_path, audio, sample_rate)
-        print("🔄 Transcription...")
-        result = _whisper_model.transcribe(audio_path, language=CONFIG["language"], fp16=False)
-    finally:
-        try:
-            os.remove(audio_path)
-        except OSError:
-            pass
+    print("🔄 Transcription...")
+    result = _whisper_model.transcribe(
+        audio.reshape(-1), language=CONFIG["language"], fp16=False
+    )
 
     text = result["text"].strip()
     print(f"📝 Vous: {text}")
