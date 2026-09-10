@@ -1,8 +1,11 @@
 ; Script Inno Setup pour Alfred (assistant vocal local)
 ; Compile dist\Alfred\* en un installeur Windows classique.
+; Utiliser build.py, qui enchaîne PyInstaller puis ce script.
 
 #define MyAppName "Alfred"
-#define MyAppVersion "1.5.1"
+#define VersionFile = FileOpen("version.txt")
+#define MyAppVersion = Trim(FileRead(VersionFile))
+#expr FileClose(VersionFile)
 #define MyAppExeName "Alfred.exe"
 
 [Setup]
@@ -30,7 +33,12 @@ Name: "startup"; Description: "Lancer {#MyAppName} automatiquement au démarrage
 Name: "desktopicon"; Description: "Créer un raccourci sur le Bureau"; GroupDescription: "Options supplémentaires :"; Flags: unchecked
 
 [Files]
-Source: "dist_new\Alfred\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist\Alfred\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Lus par updater.py à côté de l'exe. PyInstaller ne les produit pas : ils
+; doivent être copiés depuis la racine du dépôt, sinon la version locale est
+; lue comme « 0.0.0 » et la vérification de mise à jour est désactivée.
+Source: "version.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "update_config.json"; DestDir: "{app}"; Flags: onlyifdoesntexist
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

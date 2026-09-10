@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 """
 Assistant Vocal Local - moteur (utilisable en standalone ou depuis tray_app.py)
-Whisper (STT) + Ollama/Llama2 (LLM) + pyttsx3 (TTS) + PyAutoGUI (Actions)
+Whisper (STT) + Ollama/llama3.1 (LLM) + edge-tts/pyttsx3 (TTS) + PyAutoGUI (Actions)
 """
 
 import asyncio
-import whisper
-import pyttsx3
-import pyautogui
-import subprocess
 import json
 import os
 import re
+import subprocess
 import tempfile
 import threading
 from datetime import datetime
 
 import edge_tts
+import pyautogui
 import pygame
+import pyttsx3
 import requests
+import whisper
 
 # ============ CONFIG ============
 CONFIG = {
@@ -32,19 +32,44 @@ CONFIG = {
     "edge_pitch": "-3Hz",
 }
 
-# Applications connues (nom prononcé -> commande réelle)
+# Applications connues (nom prononcé -> argv). Des listes, jamais des chaînes
+# passées à un shell : la cible vient du LLM et ne doit pas pouvoir être
+# interprétée comme une commande.
 APPS = {
-    "bloc-notes": "notepad.exe",
-    "notepad": "notepad.exe",
-    "calculatrice": "calc.exe",
-    "calculette": "calc.exe",
-    "explorateur": "explorer.exe",
-    "paint": "mspaint.exe",
-    "chrome": "start chrome",
-    "navigateur": "start chrome",
-    "firefox": "start firefox",
-    "edge": "start msedge",
+    "bloc-notes": ["notepad.exe"],
+    "notepad": ["notepad.exe"],
+    "calculatrice": ["calc.exe"],
+    "calculette": ["calc.exe"],
+    "explorateur": ["explorer.exe"],
+    "paint": ["mspaint.exe"],
+    "chrome": ["cmd", "/c", "start", "", "chrome"],
+    "navigateur": ["cmd", "/c", "start", "", "chrome"],
+    "firefox": ["cmd", "/c", "start", "", "firefox"],
+    "edge": ["cmd", "/c", "start", "", "msedge"],
 }
+
+# Actions irréversibles : jamais exécutées sur la seule foi du classement du
+# LLM, qui se trompe régulièrement de catégorie.
+DESTRUCTIVE_ACTIONS = {"shutdown", "restart"}
+CONFIRM_WORDS = ("oui", "confirme", "confirmé", "vas-y", "allez-y", "je confirme")
+
+# Phrases qui arrêtent l'assistant, comparées à l'identique après
+# normalisation : une commande comme « arrête la musique » doit partir au LLM
+# et non couper Alfred.
+STOP_PHRASES = {
+    "stop", "arrête", "arrete", "arrête-toi", "arrete-toi", "arrête toi",
+    "arrete toi", "quitte", "quitter", "au revoir", "tais-toi", "tais toi",
+    "arrête alfred", "arrete alfred", "alfred arrête", "alfred arrete",
+    "c'est tout", "ce sera tout",
+}
+
+# Nom d'exécutable ou de processus plausible : garde-fou sur la sortie non
+# déterministe du LLM avant de la passer à CreateProcess ou à taskkill.
+_SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _.\-]{0,63}")
+
+# Nombre d'erreurs consécutives tolérées avant de renoncer, pour ne pas
+# boucler indéfiniment quand la panne est permanente (micro absent, etc.).
+MAX_ECHECS = 5
 
 # ============ INIT (paresseux : chargé au premier appel) ============
 _whisper_model = None
@@ -67,18 +92,36 @@ def _select_voice(engine):
     return voix_francaises[0].id
 
 
-def _ensure_loaded():
-    global _whisper_model, _tts_engine
+def _ensure_whisper():
+    global _whisper_model
     with _init_lock:
         if _whisper_model is None:
             _whisper_model = whisper.load_model(CONFIG["whisper_model"])
+
+
+def _ensure_tts():
+    global _tts_engine
+    with _init_lock:
         if _tts_engine is None:
-            _tts_engine = pyttsx3.init()
-            _tts_engine.setProperty('rate', 150)
-            _tts_engine.setProperty('volume', 0.9)
-            voice_id = _select_voice(_tts_engine)
+            engine = pyttsx3.init()
+            engine.setProperty('rate', 150)
+            engine.setProperty('volume', 0.9)
+            voice_id = _select_voice(engine)
             if voice_id:
-                _tts_engine.setProperty('voice', voice_id)
+                engine.setProperty('voice', voice_id)
+            _tts_engine = engine
+
+
+def _ensure_loaded():
+    _ensure_whisper()
+    _ensure_tts()
+
+
+def _normalize(texte):
+    """Minuscules, ponctuation finale et espaces superflus retirés."""
+    t = str(texte).strip().lower()
+    t = re.sub(r"[.!?…,;:]+$", "", t)
+    return re.sub(r"\s+", " ", t).strip()
 
 
 # ============ SPEECH TO TEXT ============
@@ -86,6 +129,8 @@ def listen():
     """Écoute le microphone et retourne le texte"""
     import sounddevice as sd
     import soundfile as sf
+
+    _ensure_whisper()
 
     print("🎤 Écoute...")
     duration = 5
@@ -100,7 +145,10 @@ def listen():
         print("🔄 Transcription...")
         result = _whisper_model.transcribe(audio_path, language=CONFIG["language"], fp16=False)
     finally:
-        os.remove(audio_path)
+        try:
+            os.remove(audio_path)
+        except OSError:
+            pass
 
     text = result["text"].strip()
     print(f"📝 Vous: {text}")
@@ -109,21 +157,27 @@ def listen():
 
 # ============ LLM ENGINE ============
 def query_ollama(prompt):
-    """Appelle Ollama pour traiter la commande"""
+    """Appelle Ollama pour traiter la commande.
+
+    Retourne le texte du modèle, ou None si Ollama est injoignable — la cause
+    est journalisée, sinon une panne d'Ollama se traduisait juste par un
+    « Je n'ai pas compris » sans indice pour l'utilisateur."""
     try:
         response = requests.post(
             f"{CONFIG['ollama_host']}/api/generate",
             json={"model": CONFIG["ollama_model"], "prompt": prompt, "stream": False},
             timeout=30
         )
-        if response.status_code == 200:
-            return response.json()["response"]
-        return "Erreur de connexion Ollama"
+        if response.status_code != 200:
+            print(f"❌ Ollama a répondu {response.status_code} : {response.text[:200]}")
+            return None
+        return response.json()["response"]
     except requests.exceptions.RequestException as e:
-        return f"Erreur: {str(e)}"
+        print(f"❌ Ollama injoignable sur {CONFIG['ollama_host']} : {e}")
+        return None
 
 
-PERSONA = f"""Tu es {{name}}, un majordome anglais d'une soixantaine d'années, au service de l'utilisateur \
+PERSONA = """Tu es {name}, un majordome anglais d'une soixantaine d'années, au service de l'utilisateur \
 depuis de nombreuses années. Tu es calme, courtois, un brin pince-sans-rire, et tu vouvoies toujours \
 l'utilisateur. Tes réponses sont brèves (une phrase, deux maximum) mais jamais froides ni robotiques : \
 elles ont la voix d'un homme posé qui a de l'expérience et un léger sens de l'humour discret. Tu ne \
@@ -153,13 +207,20 @@ Exemple:
 Réponds maintenant en JSON uniquement:"""
 
     response = query_ollama(prompt)
+    if response is None:
+        return {"action": "help", "target": "",
+                "response": "Je n'arrive pas à joindre mon moteur de langage, monsieur."}
+
     # Le LLM entoure parfois le JSON de texte explicatif ou de balises ```json ... ```
     match = re.search(r"\{.*\}", response, re.DOTALL)
     if match:
         try:
-            return json.loads(match.group(0))
+            command = json.loads(match.group(0))
+            if isinstance(command, dict):
+                return command
         except json.JSONDecodeError:
             pass
+    print(f"⚠️  Réponse du modèle non exploitable : {response[:300]!r}")
     return {"action": "help", "target": "", "response": "Je n'ai pas compris"}
 
 
@@ -179,30 +240,87 @@ def _speak_edge(text):
 
         if not pygame.mixer.get_init():
             pygame.mixer.init()
-        pygame.mixer.music.load(audio_path)
-        pygame.mixer.music.play()
-        while pygame.mixer.music.get_busy():
-            pygame.time.wait(100)
-        pygame.mixer.music.unload()
+        try:
+            pygame.mixer.music.load(audio_path)
+            pygame.mixer.music.play()
+            while pygame.mixer.music.get_busy():
+                pygame.time.wait(100)
+        finally:
+            # Sans unload(), pygame garde le fichier ouvert et la suppression
+            # échoue sur Windows en masquant l'erreur d'origine.
+            try:
+                pygame.mixer.music.unload()
+            except Exception:
+                pass
     finally:
-        os.remove(audio_path)
+        try:
+            os.remove(audio_path)
+        except OSError:
+            pass
 
 
 def speak(text):
     """Parle le texte. Utilise la voix Remy (Edge, masculine, française) si
-    internet est disponible, sinon retombe sur la voix locale (Hortense)."""
+    internet est disponible, sinon retombe sur la voix locale (Hortense).
+
+    Ne lève jamais : speak() est appelé depuis les gestionnaires d'erreur de
+    la boucle principale, où une exception tuerait le thread."""
     print(f"🔊 {CONFIG['assistant_name']}: {text}")
     try:
         _speak_edge(text)
+        return
     except Exception as e:
         print(f"⚠️  Voix Edge indisponible ({e}), repli sur la voix locale")
+
+    try:
+        _ensure_tts()
         _tts_engine.say(text)
         _tts_engine.runAndWait()
+    except Exception as e:
+        print(f"⚠️  Voix locale indisponible également : {e}")
 
 
 # ============ ACTIONS SYSTEM ============
+def _app_key(nom):
+    """Clé de recherche tolérante : le LLM renvoie indifféremment
+    « bloc-notes », « bloc_notes », « Bloc Notes »… pour la même application."""
+    return re.sub(r"[\s_\-]+", "", _normalize(nom))
+
+
+_APPS_INDEX = {_app_key(cle): argv for cle, argv in APPS.items()}
+
+
+def _open_app(target):
+    argv = _APPS_INDEX.get(_app_key(target))
+    if argv:
+        subprocess.Popen(argv)
+        return True
+
+    nom = str(target).strip()
+    if not _SAFE_NAME.fullmatch(nom):
+        print(f"❌ Nom d'application refusé : {nom!r}")
+        return False
+    subprocess.Popen([nom])
+    return True
+
+
+def _close_app(target):
+    nom = str(target).strip()
+    if nom.lower().endswith(".exe"):
+        nom = nom[:-4]
+    if not _SAFE_NAME.fullmatch(nom):
+        print(f"❌ Nom de processus refusé : {nom!r}")
+        return False
+    resultat = subprocess.run(["taskkill", "/IM", f"{nom}.exe", "/F"], capture_output=True)
+    return resultat.returncode == 0
+
+
 def execute_action(action, target):
-    """Exécute une action sur le PC. Retourne True si l'action a réussi."""
+    """Exécute une action sur le PC.
+
+    Retourne l'heure (str) pour `time`, True si l'action a abouti, et False
+    si elle a échoué ou a été refusée — l'appelant doit en tenir compte pour
+    ne pas confirmer à l'oral une action qui n'a rien fait."""
     try:
         if action == "play_pause":
             pyautogui.press('playpause')
@@ -222,23 +340,16 @@ def execute_action(action, target):
                 pyautogui.press('volumedown')
 
         elif action == "open_app":
-            commande = APPS.get(target.lower().strip(), target)
-            if commande.startswith("start "):
-                os.system(commande)
-            else:
-                subprocess.Popen(commande)
+            return _open_app(target)
 
         elif action == "close_app":
-            nom = target.strip()
-            if nom.lower().endswith(".exe"):
-                nom = nom[:-4]
-            subprocess.run(f"taskkill /IM {nom}.exe /F", shell=True, capture_output=True)
+            return _close_app(target)
 
         elif action == "shutdown":
-            subprocess.run("shutdown /s /t 30", shell=True)
+            subprocess.run(["shutdown", "/s", "/t", "30"], capture_output=True)
 
         elif action == "restart":
-            subprocess.run("shutdown /r /t 30", shell=True)
+            subprocess.run(["shutdown", "/r", "/t", "30"], capture_output=True)
 
         elif action == "time":
             return datetime.now().strftime("%H:%M")
@@ -247,6 +358,15 @@ def execute_action(action, target):
     except Exception as e:
         print(f"❌ Erreur exécution: {e}")
         return False
+
+
+def _confirm_destructive(action):
+    """Demande une confirmation vocale explicite avant une action irréversible."""
+    libelle = "éteindre l'ordinateur" if action == "shutdown" else "redémarrer l'ordinateur"
+    speak(f"Confirmez-vous que je dois {libelle} ? Dites oui pour valider.")
+    reponse = _normalize(listen())
+    print(f"Confirmation entendue : {reponse!r}")
+    return any(mot in reponse for mot in CONFIRM_WORDS)
 
 
 # ============ MAIN LOOP ============
@@ -263,6 +383,7 @@ def run(stop_event=None):
     _ensure_loaded()
     speak(f"Eh bien, {CONFIG['assistant_name']} à votre service. Dites-moi ce dont vous avez besoin.")
 
+    echecs = 0
     while not stop_event.is_set():
         try:
             user_input = listen()
@@ -273,33 +394,47 @@ def run(stop_event=None):
             if not user_input:
                 continue
 
-            texte_min = user_input.lower()
-            if any(mot in texte_min for mot in ["arrête", "arrete", "stop", "quitte"]):
+            if _normalize(user_input) in STOP_PHRASES:
                 speak("Très bien, je reste à votre entière disposition.")
                 break
 
             command = interpret_command(user_input)
-            action = command.get("action", "help")
-            target = command.get("target", "")
-            response = command.get("response", "Commande non reconnue")
+            action = str(command.get("action") or "help")
+            target = str(command.get("target") or "")
+            response = str(command.get("response") or "Commande non reconnue")
+
+            if action in DESTRUCTIVE_ACTIONS and not _confirm_destructive(action):
+                speak("Fort bien, je n'y touche pas.")
+                continue
 
             resultat = execute_action(action, target)
             if action == "time" and resultat:
                 response = f"Il est {resultat}, monsieur."
+            elif resultat is False:
+                response = "Je n'ai pas pu m'en occuper, monsieur."
             speak(response)
+
+            echecs = 0
 
         except KeyboardInterrupt:
             speak("Fort bien, je me retire pour cette fois.")
             break
         except Exception as e:
-            print(f"Erreur: {e}")
-            speak("Toutes mes excuses, un contretemps est survenu.")
+            echecs += 1
+            print(f"Erreur (échec {echecs}/{MAX_ECHECS}) : {e}")
+            if echecs == 1:
+                speak("Toutes mes excuses, un contretemps est survenu.")
+            if echecs >= MAX_ECHECS:
+                speak("Je rencontre un problème persistant, je me mets en veille.")
+                raise RuntimeError(f"{echecs} échecs consécutifs, dernier : {e}") from e
+            # Attente croissante, interruptible par une demande d'arrêt.
+            stop_event.wait(min(2 ** echecs, 30))
 
 
 if __name__ == "__main__":
     print("\n⚙️  Prérequis:")
     print("1. Installer Ollama: https://ollama.ai")
-    print("2. Télécharger Llama2: ollama pull llama2")
+    print(f"2. Télécharger le modèle: ollama pull {CONFIG['ollama_model']}")
     print("3. Lancer Ollama: ollama serve\n")
 
     input("Appuyez sur Entrée quand Ollama est lancé...")

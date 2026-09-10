@@ -1,6 +1,10 @@
-"""Ajoute/retire l'assistant vocal du démarrage automatique de Windows,
-via un raccourci dans le dossier "Démarrage" de l'utilisateur (aucune
-modification du Registre ni des paramètres système)."""
+"""Ajoute/retire Alfred du démarrage automatique de Windows, via un raccourci
+dans le dossier "Démarrage" de l'utilisateur (aucune modification du Registre
+ni des paramètres système).
+
+L'installeur crée le même raccourci quand on coche l'option correspondante :
+le nom de fichier est volontairement identique pour qu'on ne puisse pas
+cumuler deux lancements au démarrage."""
 
 import os
 import sys
@@ -8,7 +12,7 @@ import sys
 from win32com.client import Dispatch
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SHORTCUT_NAME = "AssistantVocal.lnk"
+SHORTCUT_NAME = "Alfred.lnk"
 
 
 def _startup_dir():
@@ -19,18 +23,28 @@ def _shortcut_path():
     return os.path.join(_startup_dir(), SHORTCUT_NAME)
 
 
-def install():
-    tray_script = os.path.join(BASE_DIR, "tray_app.py")
+def _launch_target():
+    """(cible, arguments, dossier de travail) selon qu'on tourne depuis
+    l'exécutable compilé ou depuis les sources."""
+    if getattr(sys, "frozen", False):
+        exe = sys.executable
+        return exe, "", os.path.dirname(exe)
+
     pythonw = sys.executable.replace("python.exe", "pythonw.exe")
     if not os.path.exists(pythonw):
         pythonw = sys.executable  # fallback si pythonw introuvable
+    return pythonw, f'"{os.path.join(BASE_DIR, "tray_app.py")}"', BASE_DIR
+
+
+def install():
+    cible, arguments, dossier = _launch_target()
 
     shell = Dispatch("WScript.Shell")
     shortcut = shell.CreateShortCut(_shortcut_path())
-    shortcut.TargetPath = pythonw
-    shortcut.Arguments = f'"{tray_script}"'
-    shortcut.WorkingDirectory = BASE_DIR
-    shortcut.IconLocation = pythonw
+    shortcut.TargetPath = cible
+    shortcut.Arguments = arguments
+    shortcut.WorkingDirectory = dossier
+    shortcut.IconLocation = cible
     shortcut.Save()
     print(f"Démarrage automatique activé : {_shortcut_path()}")
 
